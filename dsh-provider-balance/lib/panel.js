@@ -190,21 +190,23 @@ async function refreshProvider(providerId) {
 }
 
 async function doRefresh() {
-  if (isRefreshing) return
-  isRefreshing = true
+  refreshAbort?.abort()
+  refreshAbort = new AbortController()
   try {
     const res = await fetch(`${API_BASE}/refresh.json`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: '{}'
+      body: '{}',
+      signal: refreshAbort.signal
     })
     const data = await res.json()
     lastData = data
     const panel = document.querySelector('#dsh-pb-panel')
     if (panel) panel.innerHTML = renderPanel(data)
-  } catch (e) { console.error('[dsh-pb] refresh error:', e) }
-  finally {
-    setTimeout(() => { isRefreshing = false }, 1000)
+  } catch (e) {
+    if (e.name !== 'AbortError') console.error('[dsh-pb] refresh error:', e)
+  } finally {
+    refreshAbort = null
   }
 }
 

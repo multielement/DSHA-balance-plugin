@@ -18,14 +18,14 @@
     --pb-border: #ddd;
   }
 }
-#dsh-pb-root { position: fixed; bottom: 20px; right: 20px; z-index: 2147483646; font-family: system-ui, sans-serif; font-size: 13px; }
+#dsh-pb-root { position: fixed; bottom: 20px; right: 20px; z-index: 2147483646; font-family: system-ui, sans-serif; font-size: 13px }
 .pill {
   display: flex; align-items: center; gap: 6px;
   height: var(--pb-pill-h); width: var(--pb-pill-w);
   background: var(--pb-bg); color: var(--pb-fg);
   border: 1px solid var(--pb-border); border-radius: 22px;
   padding: 0 14px; cursor: pointer; user-select: none;
-  box-shadow: 0 2px 12px rgba(0,0,0,.25); transition: transform .15s;
+  box-shadow: 0 2px 12px rgba(0,0,0,.25); transition: transform .15s
 }
 .pill:hover { transform: scale(1.04) }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--pb-success); flex-shrink: 0 }
@@ -39,7 +39,7 @@
   background: var(--pb-bg); color: var(--pb-fg);
   border: 1px solid var(--pb-border); border-radius: 14px;
   box-shadow: 0 4px 24px rgba(0,0,0,.3); overflow: hidden;
-  display: flex; flex-direction: column; z-index: 2147483647;
+  display: flex; flex-direction: column; z-index: 2147483647
 }
 .panel.hidden { display: none }
 .pheader { display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; border-bottom: 1px solid var(--pb-border) }
@@ -65,7 +65,7 @@
 .pactions { display: flex; gap: 6px; margin-bottom: 8px }
 .btn-set, .btn-r, .btn-refresh-all, .btn-close {
   border: 1px solid var(--pb-border); background: transparent; color: var(--pb-fg);
-  border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer;
+  border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer
 }
 .btn-set:hover, .btn-r:hover { background: #222 }
 .ppricing { font-size: 12px }

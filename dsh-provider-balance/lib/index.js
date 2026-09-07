@@ -81,16 +81,8 @@ export function ensureStateSync(file) {
 // ================================================================
 // 异步缓存（单 key 单 promise，带 TTL；失败自动出队允许重试）
 // ================================================================
-const _cache = new Map()
-export function cachedAsync(fn, key, ttlMs) {
-  const entry = _cache.get(key)
-  if (entry && Date.now() - entry.ts < ttlMs) return entry.val
-  const p = fn()
-    .then(v => { _cache.set(key, { val: v, ts: Date.now() }); return v })
-    .catch(e => { _cache.delete(key); throw e })  // 失败即出队，下次调用重新发起请求
-  _cache.set(key, { val: p, ts: Date.now() })
-  return p
-}
+// 异步缓存（单 key 单 promise，带 TTL；失败自动出队允许重试）
+// ================================================================
 
 // ================================================================
 // HTTP 请求（带超时）
