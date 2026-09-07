@@ -18,7 +18,7 @@ import {
   pickBalanceInfo, normalizeOneApiPricing, estimateCostFromUsage,
   ONE_API_QUOTA_PER_USD,
   stateFile, writeStateSync, readStateSync, ensureStateSync,
-  collectProviders
+  cachedAsync
 } from '../lib/index.js'
 
 // 面板纯函数（复制 panel.js 核心逻辑，避免动态 ESM 导入）
@@ -274,7 +274,41 @@ describe('panel.js / panel.css 文件存在性', () => {
   })
 })
 
-describe('renderPanel 输出验证', () => {
+  describe('cachedAsync 缓存与失败处理', () => {
+    it('缓存返回值并在 TTL 内复用', async () => {
+      let callCount = 0
+      const fn = () => { callCount++; return Promise.resolve(42) }
+      const r1 = await cachedAsync(fn, 'test1', 1000)
+      const r2 = await cachedAsync(fn, 'test1', 1000)
+      assert.strictEqual(r1, 42)
+      assert.strictEqual(r2, 42)
+      assert.strictEqual(callCount, 1, 'fn should only be called once within TTL')
+    })
+
+    it('TTL 过期后重新调用', async () => {
+      let callCount = 0
+      const fn = () => { callCount++; return Promise.resolve(callCount) }
+      await cachedAsync(fn, 'test2', 50)
+      await new Promise(r => setTimeout(r, 60))
+      const r = await cachedAsync(fn, 'test2', 50)
+      assert.strictEqual(callCount, 2, 'fn should be called again after TTL')
+      assert.strictEqual(r, 2)
+    })
+
+    it('失败时出队允许重试', async () => {
+      let callCount = 0
+      const fn = () => { callCount++; return Promise.reject(new Error('fail')) }
+      try { await cachedAsync(fn, 'test3', 1000) } catch {}
+      assert.strictEqual(callCount, 1)
+      // 重试应该成功
+      const fn2 = () => Promise.resolve('ok')
+      const r = await cachedAsync(fn2, 'test3', 1000)
+      assert.strictEqual(r, 'ok')
+      assert.strictEqual(callCount, 1, 'original fn should not be retried')
+    })
+  })
+
+  describe('renderPanel 输出验证', () => {
   it('renderPanel 正常数据包含关键文本', () => {
     const data = {
       ok: true,
