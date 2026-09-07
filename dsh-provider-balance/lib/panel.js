@@ -5,6 +5,8 @@
 
 const API_BASE = '/dsh-provider-balance'
 let lastData = null
+let pollTimer = null
+let isRefreshing = false
 
 // ================================================================
 // 工具
@@ -114,13 +116,32 @@ function mount() {
   const pill = root.querySelector('#dsh-pb-pill')
   const panel = root.querySelector('#dsh-pb-panel')
 
+  // 事件委托到 root，避免全局监听器泄漏
+  root.addEventListener('click', (e) => {
+    const btn = e.target.closest('button')
+    if (btn?.dataset.provider) {
+      if (btn.classList.contains('btn-r')) {
+        refreshProvider(btn.dataset.provider)
+        return
+      }
+      if (btn.classList.contains('btn-set')) {
+        showSetBalance(btn.dataset.provider, btn.dataset.mode || 'auto', lastData)
+        return
+      }
+    }
+    if (e.target.id === 'pb-refresh-all') {
+      doRefresh()
+      return
+    }
+    if (e.target.id === 'pb-close') {
+      panel.classList.add('hidden')
+    }
+  })
+
   pill.addEventListener('click', () => {
     panel.classList.toggle('hidden')
     if (!panel.classList.contains('hidden')) poll()
   })
-
-  root.querySelector('#pb-close').addEventListener('click', () => panel.classList.add('hidden'))
-  root.querySelector('#pb-refresh-all').addEventListener('click', doRefresh)
 }
 
 async function poll() {
@@ -144,7 +165,23 @@ async function poll() {
   }
 }
 
+async function refreshProvider(providerId) {
+  try {
+    const res = await fetch(`${API_BASE}/refresh.json`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: providerId })
+    })
+    const data = await res.json()
+    lastData = data
+    const panel = document.querySelector('#dsh-pb-panel')
+    if (panel) panel.innerHTML = renderPanel(data)
+  } catch (e) { console.error('[dsh-pb] refresh provider error:', e) }
+}
+
 async function doRefresh() {
+  if (isRefreshing) return
+  isRefreshing = true
   try {
     const res = await fetch(`${API_BASE}/refresh.json`, {
       method: 'POST',
@@ -156,31 +193,10 @@ async function doRefresh() {
     const panel = document.querySelector('#dsh-pb-panel')
     if (panel) panel.innerHTML = renderPanel(data)
   } catch (e) { console.error('[dsh-pb] refresh error:', e) }
+  finally {
+    setTimeout(() => { isRefreshing = false }, 1000)
+  }
 }
-
-// 面板内按钮事件代理
-document.addEventListener('click', async (e) => {
-  const btn = e.target.closest('button')
-  if (!btn) return
-  const provider = btn.dataset.provider
-  if (btn.classList.contains('btn-r') && provider) {
-    // 只刷新该供应商
-    const res = await fetch(`${API_BASE}/refresh.json`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ provider })
-    })
-    const data = await res.json()
-    lastData = data
-    const panel = document.querySelector('#dsh-pb-panel')
-    if (panel) panel.innerHTML = renderPanel(data)
-    return
-  }
-  if (btn.classList.contains('btn-set') && provider) {
-    showSetBalance(provider, btn.dataset.mode || 'auto', lastData)
-    return
-  }
-})
 
 // ================================================================
 // 设置余额对话框
@@ -212,22 +228,32 @@ function showSetBalance(providerId, mode, data) {
       </div>
     </div>`
   document.body.appendChild(dlg)
-  dlg.querySelector('#dlg-ok').addEventListener('click', async () => {
-    const bal = parseFloat(dlg.querySelector('#dlg-bal').value)
-    const cur = dlg.querySelector('#dlg-cur').value
-    if (isNaN(bal)) { alert('请输入有效数字') ; return }
-    const res = await fetch(`${API_BASE}/custom.json`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ provider: providerId, balance: bal, currency: cur, resetBooks: mode === 'custom' })
-    })
-    const json = await res.json()
-    if (!json.ok) { alert('保存失败: ' + (json.error || '')) ; return }
+  
+  const cleanup = () => {
     document.body.removeChild(dlg)
-    await poll()
-  })
-  dlg.querySelector('#dlg-cancel').addEventListener('click', () => document.body.removeChild(dlg))
-  dlg.querySelector('.dlg-mask').addEventListener('click', () => document.body.removeChild(dlg))
+    dlg.removeEventListener('click', handleClick)
+  }
+  
+  async function handleClick(e) {
+    if (e.target.id === 'dlg-ok') {
+      const bal = parseFloat(dlg.querySelector('#dlg-bal').value)
+      const cur = dlg.querySelector('#dlg-cur').value
+      if (isNaN(bal)) { alert('请输入有效数字'); return }
+      const res = await fetch(`${API_BASE}/custom.json`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ provider: providerId, balance: bal, currency: cur, resetBooks: mode === 'custom' })
+      })
+      const json = await res.json()
+      if (!json.ok) { alert('保存失败: ' + (json.error || '')); return }
+      cleanup()
+      await poll()
+    } else if (e.target.id === 'dlg-cancel' || e.target.classList.contains('dlg-mask')) {
+      cleanup()
+    }
+  }
+  
+  dlg.addEventListener('click', handleClick)
 }
 
 // ================================================================
@@ -236,7 +262,7 @@ function showSetBalance(providerId, mode, data) {
 function start() {
   mount()
   poll()
-  setInterval(poll, 60_000)
+  pollTimer = setInterval(poll, 60_000)
 }
 
 if (document.readyState === 'loading') {
@@ -250,3 +276,4 @@ export const API_BASE = API_BASE
 export const renderPanel = renderPanel
 export const fmt = fmt
 export const esc = esc
+export const stopPolling = () => clearInterval(pollTimer)
