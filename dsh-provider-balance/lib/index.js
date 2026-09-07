@@ -14,13 +14,13 @@ export const PLUGIN_NAME = '供应商余额管家'
 export const PLUGIN_VERSION = '1.0.0'
 
 // DSH 插件加载契约：必须导出小写 name / inject（loader 读取 entry.options.name）
+// 仅声明必需服务，缺失的会被置 null（collectProviders 已做容错）
 export const name = PLUGIN_ID
-export const inject = ['webServer', 'credentials', 'settings', 'llm']
+export const inject = ['webServer', 'credentials']
 
 // 向后兼容旧测试引用
 export const NAME = PLUGIN_ID
 export const INJECT = inject
-
 const ROUTE_BASE = '/' + PLUGIN_ID
 export const ONE_API_QUOTA_PER_USD = 500_000
 export const BALANCE_TTL_MS = 60_000
@@ -561,18 +561,27 @@ export function apply(ctx) {
   ]
 
   for (const { kind, path, fn } of routeTable) {
-    const disposer = ctx.webServer.register({ kind, path, handler: fn })
-    if (typeof disposer === 'function') disposers.push(disposer)
+    try {
+      const disposer = ctx.webServer.register({ kind, path, handler: fn })
+      if (typeof disposer === 'function') disposers.push(disposer)
+    } catch (e) {
+      // duplicate route 等异常不应阻断 DSH web ui 启动
+      console.error(`[${PLUGIN_ID}] route register failed (${path}):`, e.message)
+    }
   }
 
   // 注入 panel.js + panel.css 到 index.html
-  const tapDisposer = ctx.webServer.tapIndex(async (html) => {
-    if (!html || html.indexOf(ROUTE_BASE) !== -1) return html
-    const css = `<link rel="stylesheet" href="${ROUTE_BASE}/panel.css">`
-    const js = `<script type="module" src="${ROUTE_BASE}/panel.js"></script>`
-    return (html || '').replace('</head>', `${css}\n${js}\n</head>`)
-  })
-  if (typeof tapDisposer === 'function') disposers.push(tapDisposer)
+  try {
+    const tapDisposer = ctx.webServer.tapIndex(async (html) => {
+      if (!html || html.indexOf(ROUTE_BASE) !== -1) return html
+      const css = `<link rel="stylesheet" href="${ROUTE_BASE}/panel.css">`
+      const js = `<script type="module" src="${ROUTE_BASE}/panel.js"></script>`
+      return (html || '').replace('</head>', `${css}\n${js}\n</head>`)
+    })
+    if (typeof tapDisposer === 'function') disposers.push(tapDisposer)
+  } catch (e) {
+    console.error(`[${PLUGIN_ID}] tapIndex failed:`, e.message)
+  }
 
   // HMR/重载时清理路由和注入，避免重复注册导致 web ui 无法启动
   if (typeof ctx.effect === 'function') {
