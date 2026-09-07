@@ -377,6 +377,7 @@ export function apply(ctx) {
   const balanceCache = new Map()
   const pricingCache = new Map()
   let lastSummary = null
+  const disposers = []
   const subscribers = new Set()
 
   // 读取面板文件（启动时）
@@ -444,7 +445,7 @@ export function apply(ctx) {
 
   async function init() {
     try { providers = await collectProviders(ctx) } catch (e) { console.error('[provider-balance] collectProviders failed:', e) }
-    createUsageTracker(ctx, stateFilePath, () => { lastSummary = null }, providers)
+    stopUsageTracker = createUsageTracker(ctx, stateFilePath, () => { lastSummary = null }, providers)
     lastSummary = await buildSummary()
     console.log(`[${PLUGIN_ID}] ready — providers=${providers.length}`)
   }
@@ -554,15 +555,28 @@ export function apply(ctx) {
   ]
 
   for (const { kind, path, fn } of routeTable) {
-    ctx.webServer.register({ kind, path, handler: fn })
+    const disposer = ctx.webServer.register({ kind, path, handler: fn })
+    if (typeof disposer === 'function') disposers.push(disposer)
   }
 
   // 注入 panel.js + panel.css 到 index.html
-  ctx.webServer.tapIndex(async (html) => {
+  const tapDisposer = ctx.webServer.tapIndex(async (html) => {
+    if (!html || html.indexOf(ROUTE_BASE) !== -1) return html
     const css = `<link rel="stylesheet" href="${ROUTE_BASE}/panel.css">`
     const js = `<script type="module" src="${ROUTE_BASE}/panel.js"></script>`
     return (html || '').replace('</head>', `${css}\n${js}\n</head>`)
   })
+  if (typeof tapDisposer === 'function') disposers.push(tapDisposer)
+
+  // HMR/重载时清理路由和注入，避免重复注册导致 web ui 无法启动
+  if (typeof ctx.effect === 'function') {
+    ctx.effect(() => () => {
+      for (const d of disposers) {
+        try { d() } catch {}
+      }
+      stopUsageTracker()
+    })
+  }
 
   // 暴露内部接口（供测试、其他插件）
   return {
