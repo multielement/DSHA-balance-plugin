@@ -257,14 +257,17 @@ export async function collectProviders(ctx) {
 /**
  * 创建用量跟踪器：监听 session/event 事件，按 (session, turn, step) 去重，
  * 计算 delta 并累加到 state books.usage[providerId]
+ * @param {object} ctx - cordis context
+ * @param {string} stateFilePath - 状态文件路径
+ * @param {function} onUpdated - 状态变更回调
  */
-export function createUsageTracker(ctx, stateFile, onUpdated) {
+export function createUsageTracker(ctx, stateFilePath, onUpdated) {
   const prev = new Map()  // bucketKey → {provider, model, usage}
   function bucketKey(sid, turn, step) { return `${sid}|${turn}|${step}` }
 
   function applyDelta(providerId, model, delta) {
     const tk = todayKey()
-    const state = ensureStateSync(stateFile)
+    const state = ensureStateSync(stateFilePath)
     if (!state.usage[providerId]) {
       state.usage[providerId] = { todayKey: tk, todayCalls: 0, todayTokens: 0, todayCost: 0, total: {}, models: {} }
     }
@@ -285,7 +288,7 @@ export function createUsageTracker(ctx, stateFile, onUpdated) {
     bucket.models[model].calls += 1
     bucket.models[model].tokens += totalTokens
     state.seenProviders = [...new Set([...(state.seenProviders || []), providerId])]
-    writeStateSync(stateFile, state)
+    writeStateSync(stateFilePath, state)
     onUpdated()
   }
 
@@ -418,6 +421,19 @@ export function apply(ctx) {
     ctx.webServer.register({ kind, path: route, handler })
   }
 
+  // 请求体解析工具
+  function parseBody(req) {
+    return new Promise((resolve, reject) => {
+      let body = ''
+      req.on('data', chunk => { body += chunk })
+      req.on('end', () => {
+        try { resolve(JSON.parse(body || '{}')) }
+        catch (e) { reject(new Error('JSON 解析失败: ' + e.message)) }
+      })
+      req.on('error', reject)
+    })
+  }
+
   async function sendJson(res, obj, status = 200) {
     const body = JSON.stringify(obj, null, 2)
     res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' })
@@ -432,39 +448,33 @@ export function apply(ctx) {
   async function handleSummary(req, res) { await sendJson(res, await buildSummary()) }
 
   async function handleRefresh(req, res) {
-    let body = ''
-    req.on('data', d => body += d)
-    req.on('end', async () => {
-      try {
-        const { provider } = JSON.parse(body || '{}')
-        if (provider) { balanceCache.delete(`bal_${provider}`); pricingCache.delete(`price_${provider}`) }
-        else { balanceCache.clear(); pricingCache.clear() }
-        lastSummary = await buildSummary()
-        for (const cb of subscribers) { try { cb(lastSummary) } catch {} }
-        await sendJson(res, lastSummary)
-      } catch (e) { await sendJson(res, { ok: false, error: e.message }) }
-    })
+    try {
+      const body = await parseBody(req)
+      const { provider } = body
+      if (provider) { balanceCache.delete(`bal_${provider}`); pricingCache.delete(`price_${provider}`) }
+      else { balanceCache.clear(); pricingCache.clear() }
+      lastSummary = await buildSummary()
+      for (const cb of subscribers) { try { cb(lastSummary) } catch {} }
+      await sendJson(res, lastSummary)
+    } catch (e) { await sendJson(res, { ok: false, error: e.message }) }
   }
 
   async function handleCustom(req, res) {
     const state = ensureStateSync(stateFilePath)
     if (req.method === 'GET') { await sendJson(res, state.custom || {}) }
     else if (req.method === 'POST') {
-      let body = ''
-      req.on('data', d => body += d)
-      req.on('end', async () => {
-        try {
-          const { provider, balance, currency, resetBooks = false } = JSON.parse(body || '{}')
-          if (!provider) throw new Error('provider 必填')
-          if (balance == null) throw new Error('balance 必填')
-          const cur = String(currency || '').toUpperCase() || (state.books[provider]?.currency || DEFAULT_CUSTOM_CURRENCY_RELAY)
-          state.custom[provider] = { balance: Number(balance), currency: cur, updatedAt: nowIso() }
-          if (resetBooks) state.books[provider] = { spent: 0, currency: cur, updatedAt: nowIso() }
-          writeStateSync(stateFilePath, state)
-          lastSummary = null
-          await sendJson(res, { ok: true, updated: provider })
-        } catch (e) { await sendJson(res, { ok: false, error: e.message }) }
-      })
+      try {
+        const body = await parseBody(req)
+        const { provider, balance, currency, resetBooks = false } = body
+        if (!provider) throw new Error('provider 必填')
+        if (balance == null) throw new Error('balance 必填')
+        const cur = String(currency || '').toUpperCase() || (state.books[provider]?.currency || DEFAULT_CUSTOM_CURRENCY_RELAY)
+        state.custom[provider] = { balance: Number(balance), currency: cur, updatedAt: nowIso() }
+        if (resetBooks) state.books[provider] = { spent: 0, currency: cur, updatedAt: nowIso() }
+        writeStateSync(stateFilePath, state)
+        lastSummary = null
+        await sendJson(res, { ok: true, updated: provider })
+      } catch (e) { await sendJson(res, { ok: false, error: e.message }) }
     } else { await sendJson(res, { ok: false, error: 'method not allowed' }, 405) }
   }
 
@@ -477,18 +487,15 @@ export function apply(ctx) {
     const state = ensureStateSync(stateFilePath)
     if (req.method === 'GET') { await sendJson(res, state.overrides || {}) }
     else if (req.method === 'POST') {
-      let body = ''
-      req.on('data', d => body += d)
-      req.on('end', async () => {
-        try {
-          const overrides = JSON.parse(body || '{}')
-          if (typeof overrides !== 'object' || overrides === null || Array.isArray(overrides)) throw new Error('overrides 应为对象')
-          state.overrides = overrides
-          writeStateSync(stateFilePath, state)
-          lastSummary = null
-          await sendJson(res, { ok: true })
-        } catch (e) { await sendJson(res, { ok: false, error: e.message }) }
-      })
+      try {
+        const body = await parseBody(req)
+        const overrides = body
+        if (typeof overrides !== 'object' || overrides === null || Array.isArray(overrides)) throw new Error('overrides 应为对象')
+        state.overrides = overrides
+        writeStateSync(stateFilePath, state)
+        lastSummary = null
+        await sendJson(res, { ok: true })
+      } catch (e) { await sendJson(res, { ok: false, error: e.message }) }
     } else { await sendJson(res, { ok: false, error: 'method not allowed' }, 405) }
   }
 
