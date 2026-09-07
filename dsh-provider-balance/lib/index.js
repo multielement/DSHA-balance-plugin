@@ -190,7 +190,9 @@ export function normalizeOneApiPricing(raw) {
  */
 export function estimateCostFromUsage(pricing, usage, model, attribution) {
   if (!pricing) return null
-  const p = pricing.items?.find(i => i.model === model) || null
+  // 支持 overrides 覆盖
+  const overrides = pricing.overrides || {}
+  const p = overrides[model] || pricing.items?.find(i => i.model === model) || null
   const input = Number(usage?.inputTokens || 0)
   const output = Number(usage?.outputTokens || 0)
   const reasoning = Number(usage?.reasoningTokens || 0)

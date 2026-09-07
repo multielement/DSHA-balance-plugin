@@ -89,3 +89,23 @@
 .dlg-footer { display: flex; gap: 8px; justify-content: flex-end }
 .btn-ok, .btn-cancel { padding: 6px 14px; border-radius: 6px; border: 1px solid var(--pb-border); background: transparent; color: var(--pb-fg); cursor: pointer }
 .btn-ok { background: var(--pb-accent); border-color: var(--pb-accent); color: #fff }
+
+/* 移动端优化 */
+@media (max-width: 640px) {
+  #dsh-pb-root { bottom: 12px; right: 12px }
+  .pill { height: 38px; width: 110px; padding: 0 10px; font-size: 12px }
+  .dot { width: 7px; height: 7px }
+  .panel { bottom: calc(var(--pb-pill-h) + 20px); right: 12px; width: calc(100vw - 24px); max-height: 75vh }
+  .pheader { padding: 10px 12px }
+  .ptitle { font-size: 14px }
+  .plist { padding: 8px }
+  .pcard { padding: 8px 10px }
+  .pbalance { margin: 6px 0; padding: 6px 8px }
+  .bal-num { font-size: 20px }
+  .pactions { flex-wrap: wrap }
+  .btn-set, .btn-r { flex: 1; text-align: center }
+  .pfooter { padding: 8px 10px }
+  .btn-close { width: 50px }
+  .ptable { font-size: 11px }
+  .ptable th, .ptable td { padding: 2px 4px }
+}
