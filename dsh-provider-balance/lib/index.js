@@ -499,26 +499,28 @@ export function apply(ctx) {
     } else { await sendJson(res, { ok: false, error: 'method not allowed' }, 405) }
   }
 
-  async function handlePanelJs(req, res) {
-    sendText(res, panelJsContent, panelJsContent ? 200 : 404)
+  async function handleUsage(req, res) {
+    const state = ensureStateSync(stateFilePath)
+    await sendJson(res, state.usage || {})
   }
 
-  async function handlePanelCss(req, res) {
-    sendText(res, panelCssContent, panelCssContent ? 200 : 404)
-  }
+  // ============================================================
+  // HTTP 路由（数据驱动注册表）
+  // ============================================================
+  const routeTable = [
+    { kind: 'prefix', path: `${ROUTE_BASE}/summary.json`,  fn: (req, res) => sendJson(res, buildSummary()),   methods: ['GET'] },
+    { kind: 'prefix', path: `${ROUTE_BASE}/refresh.json`,  fn: handleRefresh,                                  methods: ['GET', 'POST'] },
+    { kind: 'prefix', path: `${ROUTE_BASE}/custom.json`,   fn: handleCustom,                                   methods: ['GET', 'POST'] },
+    { kind: 'prefix', path: `${ROUTE_BASE}/usage.json`,    fn: (req, res) => { const s = ensureStateSync(stateFilePath); sendJson(res, s.usage || {}) }, methods: ['GET'] },
+    { kind: 'prefix', path: `${ROUTE_BASE}/overrides.json`,fn: handleOverrides,                                methods: ['GET', 'POST'] },
+    { kind: 'prefix', path: `${ROUTE_BASE}/health.json`,   fn: (req, res) => sendJson(res, { ok: true, plugin: PLUGIN_ID, version: PLUGIN_VERSION, providers: providers.length }), methods: ['GET'] },
+    { kind: 'prefix', path: `${ROUTE_BASE}/panel.js`,      fn: (req, res) => sendText(res, panelJsContent, panelJsContent ? 200 : 404), methods: ['GET'] },
+    { kind: 'prefix', path: `${ROUTE_BASE}/panel.css`,     fn: (req, res) => sendText(res, panelCssContent, panelCssContent ? 200 : 404), methods: ['GET'] },
+  ]
 
-  async function handleHealth(req, res) {
-    await sendJson(res, { ok: true, plugin: PLUGIN_ID, version: PLUGIN_VERSION, providers: providers.length })
+  for (const { kind, path, fn, methods } of routeTable) {
+    ctx.webServer.register({ kind, path, handler: fn })
   }
-
-  registerRoute('prefix', `${ROUTE_BASE}/summary.json`, handleSummary)
-  registerRoute('prefix', `${ROUTE_BASE}/refresh.json`, handleRefresh)
-  registerRoute('prefix', `${ROUTE_BASE}/custom.json`, handleCustom)
-  registerRoute('prefix', `${ROUTE_BASE}/usage.json`, handleUsage)
-  registerRoute('prefix', `${ROUTE_BASE}/overrides.json`, handleOverrides)
-  registerRoute('prefix', `${ROUTE_BASE}/panel.js`, handlePanelJs)
-  registerRoute('prefix', `${ROUTE_BASE}/panel.css`, handlePanelCss)
-  registerRoute('prefix', `${ROUTE_BASE}/health.json`, handleHealth)
 
   // 注入 panel.js + panel.css 到 index.html
   ctx.webServer.tapIndex(async (html) => {
