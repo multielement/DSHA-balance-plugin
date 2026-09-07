@@ -18,7 +18,7 @@ import {
   pickBalanceInfo, normalizeOneApiPricing, estimateCostFromUsage,
   ONE_API_QUOTA_PER_USD,
   stateFile, writeStateSync, readStateSync, ensureStateSync,
-  collectProviders
+  collectProviders, cachedAsync
 } from '../lib/index.js'
 
 // 面板纯函数（复制 panel.js 核心逻辑，避免动态 ESM 导入）
@@ -271,6 +271,40 @@ describe('panel.js / panel.css 文件存在性', () => {
     assert.ok(panelCss.includes('.pill'), 'should contain .pill')
     assert.ok(panelCss.includes('.panel'), 'should contain .panel')
     assert.ok(panelCss.includes('.pcard'), 'should contain .pcard')
+  })
+})
+
+describe('cachedAsync 缓存与失效', () => {
+  it('缓存命中返回相同结果', async () => {
+    let calls = 0
+    const fn = () => { calls++ ; return Promise.resolve(calls) }
+    const v1 = await cachedAsync(fn, 'k1', 60000)
+    const v2 = await cachedAsync(fn, 'k1', 60000)
+    assert.equal(v1, 1)
+    assert.equal(v2, 1)
+    assert.equal(calls, 1, 'should call only once')
+  })
+
+  it('TTL 过期后重新执行', async () => {
+    let calls = 0
+    const fn = () => { calls++ ; return Promise.resolve(calls) }
+    const v1 = await cachedAsync(fn, 'k2', 0)
+    const v2 = await cachedAsync(fn, 'k2', 0)
+    assert.equal(v1, 1)
+    assert.equal(v2, 2)
+    assert.equal(calls, 2, 'should re-execute after TTL')
+  })
+
+  it('失败时不缓存，允许下次重试', async () => {
+    let calls = 0
+    const fn = () => {
+      calls++
+      if (calls < 2) return Promise.reject(new Error('fail'))
+      return Promise.resolve('ok')
+    }
+    await assert.rejects(cachedAsync(fn, 'k3', 60000))
+    const v = await cachedAsync(fn, 'k3', 60000)
+    assert.equal(v, 'ok', 'should retry on next call')
   })
 })
 
