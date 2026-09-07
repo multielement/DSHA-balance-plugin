@@ -88,15 +88,22 @@ export function ensureStateSync(file) {
 // HTTP 请求（带超时）
 // ================================================================
 export async function fetchJson(urlStr, opts = {}) {
-  const { timeout = 10_000, headers = {}, method = 'GET' } = opts
+  const { timeout = 10_000, headers = {}, method = 'GET', retries = 0, retryDelay = 500 } = opts
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(), timeout)
-  try {
-    const res = await fetch(urlStr, { ...opts, headers, method, signal: ctrl.signal })
-    const text = await res.text()
-    if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status} ${urlStr}`), { status: res.status, text })
-    try { return JSON.parse(text) } catch { return { _raw: text } }
-  } finally { clearTimeout(timer) }
+  let lastError
+  for (let i = 0; i <= retries; i++) {
+    try {
+      const res = await fetch(urlStr, { ...opts, headers, method, signal: ctrl.signal })
+      const text = await res.text()
+      if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status} ${urlStr}`), { status: res.status, text })
+      try { return JSON.parse(text) } catch { return { _raw: text } }
+    } catch (e) {
+      lastError = e
+      if (i < retries) await new Promise(r => setTimeout(r, retryDelay))
+    }
+  }
+  throw lastError
 }
 
 // ================================================================
