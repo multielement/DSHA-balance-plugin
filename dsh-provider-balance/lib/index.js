@@ -12,8 +12,14 @@ import { fileURLToPath } from 'node:url'
 export const PLUGIN_ID = 'dsh-provider-balance'
 export const PLUGIN_NAME = '供应商余额管家'
 export const PLUGIN_VERSION = '1.0.0'
+
+// DSH 插件加载契约：必须导出小写 name / inject（loader 读取 entry.options.name）
+export const name = PLUGIN_ID
+export const inject = ['webServer', 'credentials', 'settings', 'llm']
+
+// 向后兼容旧测试引用
 export const NAME = PLUGIN_ID
-export const INJECT = ['webServer', 'credentials', 'settings', 'llm']
+export const INJECT = inject
 
 const ROUTE_BASE = '/' + PLUGIN_ID
 export const ONE_API_QUOTA_PER_USD = 500_000
