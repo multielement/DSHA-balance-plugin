@@ -44,7 +44,7 @@
 ### 方式一：npm 安装（推荐）
 
 ```bash
-dsha-plugin install dsh-provider-balance@1.0.0
+dsha-plugin install dsh-provider-balance@1.0.1
 ```
 
 或本地路径：
