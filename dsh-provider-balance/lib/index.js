@@ -269,8 +269,9 @@ export async function collectProviders(ctx) {
  * @param {object} ctx - cordis context
  * @param {string} stateFilePath - 状态文件路径
  * @param {function} onUpdated - 状态变更回调
+ * @param {object} [providersRef] - 当前 providers 数组（用于价格估算）
  */
-export function createUsageTracker(ctx, stateFilePath, onUpdated) {
+export function createUsageTracker(ctx, stateFilePath, onUpdated, providersRef = null) {
   const prev = new Map()  // bucketKey → {provider, model, usage}
   function bucketKey(sid, turn, step) { return `${sid}|${turn}|${step}` }
 
@@ -293,6 +294,26 @@ export function createUsageTracker(ctx, stateFilePath, onUpdated) {
     const totalTokens = (delta.input || 0) + (delta.output || 0) + (delta.cacheRead || 0) + (delta.cacheWrite || 0) + (delta.reasoning || 0)
     bucket.todayCalls += 1
     bucket.todayTokens += totalTokens
+
+    // 估算成本并更新 usage.todayCost 和 books.spent
+    try {
+      const currentProviders = providersRef || []
+      const provider = currentProviders.find(p => p.id === providerId)
+      if (provider?.pricing) {
+        const { cost } = estimateCostFromUsage(provider.pricing, delta, model, 'session/event')
+        if (cost != null && cost > 0) {
+          bucket.todayCost = roundMoney(bucket.todayCost + cost)
+          if (!state.books[providerId]) {
+            state.books[providerId] = { spent: 0, currency: 'USD', updatedAt: nowIso() }
+          }
+          state.books[providerId].spent = roundMoney((state.books[providerId].spent || 0) + cost)
+          state.books[providerId].updatedAt = nowIso()
+        }
+      }
+    } catch (e) {
+      console.error(`[${PLUGIN_ID}] usage cost estimation error:`, e.message)
+    }
+
     if (!bucket.models[model]) bucket.models[model] = { calls: 0, tokens: 0, cost: 0 }
     bucket.models[model].calls += 1
     bucket.models[model].tokens += totalTokens
@@ -421,7 +442,7 @@ export function apply(ctx) {
 
   async function init() {
     try { providers = await collectProviders(ctx) } catch (e) { console.error('[provider-balance] collectProviders failed:', e) }
-    createUsageTracker(ctx, stateFilePath, () => { lastSummary = null })
+    createUsageTracker(ctx, stateFilePath, () => { lastSummary = null }, providers)
     lastSummary = await buildSummary()
     console.log(`[${PLUGIN_ID}] ready — providers=${providers.length}`)
   }

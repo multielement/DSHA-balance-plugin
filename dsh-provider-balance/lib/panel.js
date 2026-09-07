@@ -276,6 +276,13 @@ function start() {
   pollTimer = setInterval(poll, 60_000)
 }
 
+function stopPolling() {
+  if (pollTimer) {
+    clearInterval(pollTimer)
+    pollTimer = null
+  }
+}
+
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', start)
 } else {
@@ -283,8 +290,4 @@ if (document.readyState === 'loading') {
 }
 
 // 导出给测试用
-export const API_BASE = API_BASE
-export const renderPanel = renderPanel
-export const fmt = fmt
-export const esc = esc
-export const stopPolling = () => clearInterval(pollTimer)
+export { API_BASE, renderPanel, fmt, esc, stopPolling }
