@@ -1,0 +1,44 @@
+{
+  "name": "dsh-provider-balance",
+  "version": "1.0.0",
+  "description": "DSH/DSHA 供应商余额管家 —— 自动查询余额、识别按次/按量倍率、支持自定义余额本地记账",
+  "keywords": [
+    "dsh",
+    "dsha",
+    "deepseek-harness",
+    "balance",
+    "quota",
+    "provider",
+    "billing",
+    "plugin"
+  ],
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./index": "./lib/index.js"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DSH-APP/DSHA/issues/new?title=plugin-dsh-provider-balance"
+  },
+  "bugs": {
+    "url": "https://github.com/DSH-APP/DSHA/issues"
+  },
+  "homepage": "https://github.com/DSH-APP/DSHA",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,14 @@
+# ============================================================================
+# dsh-provider-balance —— DSH bundle patch
+# ============================================================================
+# 将供应商余额管家插入 Web profile 的配置树。
+#
+# 安装方式：
+#   dsh plugin --profile web add dsh-provider-balance
+# 或本地开发：
+#   dsh plugin --profile web add link:<本目录绝对路径>
+# ============================================================================
+
+- insert:
+    - id: dsh-provider-balance
+      name: dsh-provider-balance

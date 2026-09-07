@@ -1,0 +1,252 @@
+// dsh-provider-balance — 悬浮余额面板 (浏览器侧，零依赖 ESM)
+// 功能：展示供应商余额、计费倍率表、自定义余额编辑
+// 轮询 /dsh-provider-balance/summary.json 每 60s
+'use strict'
+
+const API_BASE = '/dsh-provider-balance'
+let lastData = null
+
+// ================================================================
+// 工具
+// ================================================================
+function fmt(n, decimals = 2) {
+  if (n == null || isNaN(n)) return '—'
+  return Number(n).toLocaleString('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: decimals })
+}
+
+function esc(s) {
+  return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+}
+
+// ================================================================
+// 渲染
+// ================================================================
+function renderCard(p) {
+  const bal = p.balance || {}
+  const mode = bal.mode || 'auto'
+  const available = bal.available !== false
+  const priceItems = (p.pricing?.items || []).slice(0, 20)
+  const today = p.usage?.todayCalls ?? 0
+  const todayCost = fmt(p.usage?.todayCost ?? 0, 4)
+  const todayTokens = fmt(p.usage?.todayTokens ?? 0, 0)
+
+  const badge = mode === 'custom'
+    ? `<span class="badge custom">自定义余额</span>`
+    : mode === 'auto'
+    ? `<span class="badge auto">${available ? '自动查询' : '查询失败'}</span>`
+    : `<span class="badge off">官方接口</span>`
+
+  const balLine = available
+    ? `<div class="bal-num">${fmt(bal.remaining ?? 0, 4)} <span class="curr">${esc(bal.currency)}</span></div>
+       <div class="bal-meta">${mode === 'custom' ? `原始余额 ${fmt(bal.total)} / 已耗 ${fmt(p.books?.spent ?? 0)}` : `总额 ${fmt(bal.total)} / 已用 ${fmt(bal.used ?? 0)}`}</div>`
+    : `<div class="bal-num bal-err">不可用</div>
+       <div class="bal-meta err">${esc(bal.error || '未知错误')}</div>`
+
+  const pricingRows = priceItems.length > 0
+    ? `<table class="ptable">
+        <thead><tr><th>模型</th><th>计费</th><th>输入倍率</th><th>输出倍率</th><th>分组倍率</th></tr></thead>
+        <tbody>${priceItems.map(m => `<tr>
+          <td>${esc(m.model)}</td>
+          <td>${m.billing === 'per-call' ? '按次' : '按量'}</td>
+          <td>${fmt(m.inputRatio, 4)}</td>
+          <td>${fmt(m.completionRatio, 4)}</td>
+          <td>${fmt(m.groupRatio, 4)}</td>
+        </tr>`).join('')}
+        </tbody>
+       </table>`
+    : `<div class="no-pricing">暂无倍率数据</div>`
+
+  const customBtn = mode === 'custom'
+    ? `<button class="btn-set" data-provider="${esc(p.id)}" data-mode="custom">修改余额</button>`
+    : `<button class="btn-set" data-provider="${esc(p.id)}" data-mode="${mode}">设置余额</button>`
+
+  const refreshBtn = `<button class="btn-r" data-provider="${esc(p.id)}">刷新</button>`
+
+  return `
+    <div class="pcard" data-id="${esc(p.id)}">
+      <div class="phead">
+        <div class="pname">${esc(p.name)} <span class="phost">${esc(p.host)}</span></div>
+        <div class="pbadges">${badge}${p.credential === 'missing' ? '<span class="badge miss">缺密钥</span>' : ''}</div>
+      </div>
+      <div class="pbalance">${balLine}</div>
+      <div class="ptoday">今日：${today} 次 / ${todayTokens} tokens / <span class="cost">${todayCost}</span></div>
+      <div class="pactions">${refreshBtn}${customBtn}</div>
+      <details class="ppricing">
+        <summary>计费倍率表 (${priceItems.length})</summary>
+        ${pricingRows}
+      </details>
+    </div>`
+}
+
+function renderPanel(data) {
+  if (!data?.ok) return `<div class="err">数据加载失败：${esc(data?.error || '')}</div>`
+  const providers = (data.providers || []).map(renderCard).join('\n')
+  const time = new Date(data.now).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+  return `
+    <div class="panel-root">
+      <div class="pheader">
+        <div class="ptitle">供应商余额管家</div>
+        <div class="ptime">更新于 ${time}</div>
+      </div>
+      <div class="plist">${providers || '<div class="empty">未发现供应商</div>'}</div>
+      <div class="pfooter">
+        <button id="pb-refresh-all" class="btn-refresh-all">全部刷新</button>
+        <button id="pb-close" class="btn-close">关闭</button>
+      </div>
+    </div>`
+}
+
+// ================================================================
+// 悬浮按钮 & 面板
+// ================================================================
+function mount() {
+  const root = document.createElement('div')
+  root.id = 'dsh-pb-root'
+  root.innerHTML = `
+    <div id="dsh-pb-pill" class="pill" title="供应商余额管家">
+      <span id="dsh-pb-pill-dot" class="dot"></span>
+      <span id="dsh-pb-pill-label">余额</span>
+    </div>
+    <div id="dsh-pb-panel" class="panel hidden">加载中...</div>
+  `
+  document.body.appendChild(root)
+
+  const pill = root.querySelector('#dsh-pb-pill')
+  const panel = root.querySelector('#dsh-pb-panel')
+
+  pill.addEventListener('click', () => {
+    panel.classList.toggle('hidden')
+    if (!panel.classList.contains('hidden')) poll()
+  })
+
+  root.querySelector('#pb-close').addEventListener('click', () => panel.classList.add('hidden'))
+  root.querySelector('#pb-refresh-all').addEventListener('click', doRefresh)
+}
+
+async function poll() {
+  try {
+    const res = await fetch(`${API_BASE}/summary.json`)
+    const data = await res.json()
+    lastData = data
+    const panel = document.querySelector('#dsh-pb-panel')
+    if (panel) panel.innerHTML = renderPanel(data)
+    const dot = document.querySelector('#dsh-pb-pill-dot')
+    if (dot) dot.className = 'dot' + (data.ok ? '' : ' err')
+    const label = document.querySelector('#dsh-pb-pill-label')
+    if (label && data.providers?.length) {
+      const avg = Math.round((data.providers.reduce((s, p) => s + (p.balance?.remaining ?? 0), 0) || 0) * 100) / 100
+      label.textContent = `余额 ${fmt(avg, 2)}`
+    }
+  } catch (e) {
+    console.error('[dsh-pb] poll error:', e)
+    const dot = document.querySelector('#dsh-pb-pill-dot')
+    if (dot) dot.className = 'dot err'
+  }
+}
+
+async function doRefresh() {
+  try {
+    const res = await fetch(`${API_BASE}/refresh.json`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}'
+    })
+    const data = await res.json()
+    lastData = data
+    const panel = document.querySelector('#dsh-pb-panel')
+    if (panel) panel.innerHTML = renderPanel(data)
+  } catch (e) { console.error('[dsh-pb] refresh error:', e) }
+}
+
+// 面板内按钮事件代理
+document.addEventListener('click', async (e) => {
+  const btn = e.target.closest('button')
+  if (!btn) return
+  const provider = btn.dataset.provider
+  if (btn.classList.contains('btn-r') && provider) {
+    // 只刷新该供应商
+    const res = await fetch(`${API_BASE}/refresh.json`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider })
+    })
+    const data = await res.json()
+    lastData = data
+    const panel = document.querySelector('#dsh-pb-panel')
+    if (panel) panel.innerHTML = renderPanel(data)
+    return
+  }
+  if (btn.classList.contains('btn-set') && provider) {
+    showSetBalance(provider, btn.dataset.mode || 'auto', lastData)
+    return
+  }
+})
+
+// ================================================================
+// 设置余额对话框
+// ================================================================
+function showSetBalance(providerId, mode, data) {
+  const existing = data?.providers?.find(p => p.id === providerId)
+  const curBal = existing?.balance
+  const name = existing?.name || providerId
+  const curVal = mode === 'custom' ? (curBal?.total ?? '') : ''
+  const dlg = document.createElement('div')
+  dlg.className = 'dlg'
+  dlg.innerHTML = `
+    <div class="dlg-mask"></div>
+    <div class="dlg-box">
+      <div class="dlg-title">设置 ${esc(name)} 余额</div>
+      <div class="dlg-body">
+        <label>当前余额 <input id="dlg-bal" type="number" step="0.01" value="${esc(String(curVal))}" placeholder="输入当前余额"></label>
+        <label>货币
+          <select id="dlg-cur">
+            <option value="USD" ${String(curVal).includes('CNY') ? '' : 'selected'}>USD</option>
+            <option value="CNY" ${String(curVal).includes('CNY') ? 'selected' : ''}>CNY</option>
+          </select>
+        </label>
+        <div class="dlg-hint">${mode === 'custom' ? '重置后将重新计算已耗费用' : '自定义余额将在本设备本地记账中使用'}</div>
+      </div>
+      <div class="dlg-footer">
+        <button id="dlg-ok" class="btn-ok">保存</button>
+        <button id="dlg-cancel" class="btn-cancel">取消</button>
+      </div>
+    </div>`
+  document.body.appendChild(dlg)
+  dlg.querySelector('#dlg-ok').addEventListener('click', async () => {
+    const bal = parseFloat(dlg.querySelector('#dlg-bal').value)
+    const cur = dlg.querySelector('#dlg-cur').value
+    if (isNaN(bal)) { alert('请输入有效数字') ; return }
+    const res = await fetch(`${API_BASE}/custom.json`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: providerId, balance: bal, currency: cur, resetBooks: mode === 'custom' })
+    })
+    const json = await res.json()
+    if (!json.ok) { alert('保存失败: ' + (json.error || '')) ; return }
+    document.body.removeChild(dlg)
+    await poll()
+  })
+  dlg.querySelector('#dlg-cancel').addEventListener('click', () => document.body.removeChild(dlg))
+  dlg.querySelector('.dlg-mask').addEventListener('click', () => document.body.removeChild(dlg))
+}
+
+// ================================================================
+// 启动
+// ================================================================
+function start() {
+  mount()
+  poll()
+  setInterval(poll, 60_000)
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', start)
+} else {
+  start()
+}
+
+// 导出给测试用
+export const API_BASE = API_BASE
+export const renderPanel = renderPanel
+export const fmt = fmt
+export const esc = esc
