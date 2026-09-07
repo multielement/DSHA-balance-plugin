@@ -205,7 +205,8 @@ export function estimateCostFromUsage(pricing, usage, model, attribution) {
   const cacheRead = Number(usage?.cacheReadTokens || 0)
   if (p?.billing === 'per-call') {
     const price = (p.perCall || 0) * (p.groupRatio || 1)
-    return { cost: roundMoney(price), currency: 'USD' }
+    // 单价可能低于 0.005（如 $0.001/次），保留 6 位小数避免抹零
+    return { cost: roundMoney(price, 6), currency: 'USD' }
   }
   // per-token: 按 one-api 约定 $1 = 500000 quota
   // 缓存 token 保守地按全价计入
