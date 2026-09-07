@@ -337,7 +337,7 @@ export function createUsageTracker(ctx, stateFile, onUpdated) {
 // 宿主插件：apply
 // ================================================================
 export function apply(ctx) {
-  const stateFile = stateFile()
+  const stateFilePath = stateFile()
   let providers = []
   const balanceCache = new Map()
   const pricingCache = new Map()
@@ -355,7 +355,7 @@ export function apply(ctx) {
   }
 
   async function probeBalance(provider, bust = false) {
-    const state = ensureStateSync(stateFile)
+    const state = ensureStateSync(stateFilePath)
     const custom = state.custom[provider.id]
     if (custom && custom.balance != null) {
       const books = state.books[provider.id] || { spent: 0, currency: custom.currency || DEFAULT_CUSTOM_CURRENCY_RELAY }
@@ -390,7 +390,7 @@ export function apply(ctx) {
   }
 
   async function buildSummary(bustAll = false) {
-    const state = ensureStateSync(stateFile)
+    const state = ensureStateSync(stateFilePath)
     const results = []
     for (const p of providers) {
       const bal = await probeBalance(p, bustAll || false)
@@ -407,7 +407,7 @@ export function apply(ctx) {
 
   async function init() {
     try { providers = await collectProviders(ctx) } catch (e) { console.error('[provider-balance] collectProviders failed:', e) }
-    createUsageTracker(ctx, stateFile, () => { lastSummary = null })
+    createUsageTracker(ctx, stateFilePath, () => { lastSummary = null })
     lastSummary = await buildSummary()
     console.log(`[${PLUGIN_ID}] ready — providers=${providers.length}`)
   }
@@ -447,7 +447,7 @@ export function apply(ctx) {
   }
 
   async function handleCustom(req, res) {
-    const state = ensureStateSync(stateFile)
+    const state = ensureStateSync(stateFilePath)
     if (req.method === 'GET') { await sendJson(res, state.custom || {}) }
     else if (req.method === 'POST') {
       let body = ''
@@ -460,7 +460,7 @@ export function apply(ctx) {
           const cur = String(currency || '').toUpperCase() || (state.books[provider]?.currency || DEFAULT_CUSTOM_CURRENCY_RELAY)
           state.custom[provider] = { balance: Number(balance), currency: cur, updatedAt: nowIso() }
           if (resetBooks) state.books[provider] = { spent: 0, currency: cur, updatedAt: nowIso() }
-          writeStateSync(stateFile, state)
+          writeStateSync(stateFilePath, state)
           lastSummary = null
           await sendJson(res, { ok: true, updated: provider })
         } catch (e) { await sendJson(res, { ok: false, error: e.message }) }
@@ -469,12 +469,12 @@ export function apply(ctx) {
   }
 
   async function handleUsage(req, res) {
-    const state = ensureStateSync(stateFile)
+    const state = ensureStateSync(stateFilePath)
     await sendJson(res, state.usage || {})
   }
 
   async function handleOverrides(req, res) {
-    const state = ensureStateSync(stateFile)
+    const state = ensureStateSync(stateFilePath)
     if (req.method === 'GET') { await sendJson(res, state.overrides || {}) }
     else if (req.method === 'POST') {
       let body = ''
@@ -484,7 +484,7 @@ export function apply(ctx) {
           const overrides = JSON.parse(body || '{}')
           if (typeof overrides !== 'object' || overrides === null || Array.isArray(overrides)) throw new Error('overrides 应为对象')
           state.overrides = overrides
-          writeStateSync(stateFile, state)
+          writeStateSync(stateFilePath, state)
           lastSummary = null
           await sendJson(res, { ok: true })
         } catch (e) { await sendJson(res, { ok: false, error: e.message }) }
