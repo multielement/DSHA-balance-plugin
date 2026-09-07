@@ -467,7 +467,10 @@ export function apply(ctx) {
       lastSummary = await buildSummary()
       for (const cb of subscribers) { try { cb(lastSummary) } catch {} }
       await sendJson(res, lastSummary)
-    } catch (e) { await sendJson(res, { ok: false, error: e.message }) }
+    } catch (e) {
+      console.error(`[${PLUGIN_ID}] refresh failed:`, e.message)
+      await sendJson(res, { ok: false, error: e.message })
+    }
   }
 
   async function handleCustom(req, res) {
@@ -485,7 +488,10 @@ export function apply(ctx) {
         writeStateSync(stateFilePath, state)
         lastSummary = null
         await sendJson(res, { ok: true, updated: provider })
-      } catch (e) { await sendJson(res, { ok: false, error: e.message }) }
+      } catch (e) {
+        console.error(`[${PLUGIN_ID}] custom balance update failed:`, e.message)
+        await sendJson(res, { ok: false, error: e.message })
+      }
     } else { await sendJson(res, { ok: false, error: 'method not allowed' }, 405) }
   }
 
