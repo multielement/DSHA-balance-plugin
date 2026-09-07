@@ -504,17 +504,17 @@ export function apply(ctx) {
   // HTTP 路由（数据驱动注册表）
   // ============================================================
   const routeTable = [
-    { kind: 'prefix', path: `${ROUTE_BASE}/summary.json`,  fn: (req, res) => sendJson(res, buildSummary()),   methods: ['GET'] },
-    { kind: 'prefix', path: `${ROUTE_BASE}/refresh.json`,  fn: handleRefresh,                                  methods: ['GET', 'POST'] },
-    { kind: 'prefix', path: `${ROUTE_BASE}/custom.json`,   fn: handleCustom,                                   methods: ['GET', 'POST'] },
-    { kind: 'prefix', path: `${ROUTE_BASE}/usage.json`,    fn: (req, res) => { const s = ensureStateSync(stateFilePath); sendJson(res, s.usage || {}) }, methods: ['GET'] },
-    { kind: 'prefix', path: `${ROUTE_BASE}/overrides.json`,fn: handleOverrides,                                methods: ['GET', 'POST'] },
-    { kind: 'prefix', path: `${ROUTE_BASE}/health.json`,   fn: (req, res) => sendJson(res, { ok: true, plugin: PLUGIN_ID, version: PLUGIN_VERSION, providers: providers.length }), methods: ['GET'] },
-    { kind: 'prefix', path: `${ROUTE_BASE}/panel.js`,      fn: (req, res) => sendText(res, panelJsContent, panelJsContent ? 200 : 404), methods: ['GET'] },
-    { kind: 'prefix', path: `${ROUTE_BASE}/panel.css`,     fn: (req, res) => sendText(res, panelCssContent, panelCssContent ? 200 : 404), methods: ['GET'] },
+    { kind: 'prefix', path: `${ROUTE_BASE}/summary.json`,  fn: (req, res) => sendJson(res, buildSummary()) },
+    { kind: 'prefix', path: `${ROUTE_BASE}/refresh.json`,  fn: handleRefresh },
+    { kind: 'prefix', path: `${ROUTE_BASE}/custom.json`,   fn: handleCustom },
+    { kind: 'prefix', path: `${ROUTE_BASE}/usage.json`,    fn: (req, res) => { const s = ensureStateSync(stateFilePath); sendJson(res, s.usage || {}) } },
+    { kind: 'prefix', path: `${ROUTE_BASE}/overrides.json`,fn: handleOverrides },
+    { kind: 'prefix', path: `${ROUTE_BASE}/health.json`,   fn: (req, res) => sendJson(res, { ok: true, plugin: PLUGIN_ID, version: PLUGIN_VERSION, providers: providers.length }) },
+    { kind: 'prefix', path: `${ROUTE_BASE}/panel.js`,      fn: (req, res) => sendText(res, panelJsContent, panelJsContent ? 200 : 404) },
+    { kind: 'prefix', path: `${ROUTE_BASE}/panel.css`,     fn: (req, res) => sendText(res, panelCssContent, panelCssContent ? 200 : 404) },
   ]
 
-  for (const { kind, path, fn, methods } of routeTable) {
+  for (const { kind, path, fn } of routeTable) {
     ctx.webServer.register({ kind, path, handler: fn })
   }
 

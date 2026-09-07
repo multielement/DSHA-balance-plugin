@@ -160,12 +160,10 @@ async function poll() {
     if (dot) dot.className = 'dot' + (data.ok ? '' : ' err')
     const label = document.querySelector('#dsh-pb-pill-label')
     if (label && data.providers?.length) {
-      const avg = data.providers?.length
-    ? Math.round((data.providers
-        .filter(p => p.balance?.available !== false)
-        .reduce((s, p) => s + (p.balance?.remaining ?? 0), 0)
-      / data.providers.filter(p => p.balance?.available !== false).length || 0) * 100) / 100
-    : 0
+      const available = data.providers.filter(p => p.balance?.available !== false)
+      const avg = available.length > 0
+        ? Math.round((available.reduce((s, p) => s + (p.balance?.remaining ?? 0), 0) / available.length) * 100) / 100
+        : 0
       label.textContent = `余额 ${fmt(avg, 2)}`
     }
   } catch (e) {
