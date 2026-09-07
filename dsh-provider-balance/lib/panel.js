@@ -6,7 +6,11 @@
 const API_BASE = '/dsh-provider-balance'
 let lastData = null
 let pollTimer = null
-let isRefreshing = false
+let refreshAbort = null
+
+// 面板关闭时清理定时器
+window.addEventListener('beforeunload', stopPolling)
+window.addEventListener('pageshow', () => { if (!pollTimer) start() })
 
 // ================================================================
 // 工具
@@ -135,6 +139,7 @@ function mount() {
     }
     if (e.target.id === 'pb-close') {
       panel.classList.add('hidden')
+      stopPolling()
     }
   })
 
@@ -155,7 +160,12 @@ async function poll() {
     if (dot) dot.className = 'dot' + (data.ok ? '' : ' err')
     const label = document.querySelector('#dsh-pb-pill-label')
     if (label && data.providers?.length) {
-      const avg = Math.round((data.providers.reduce((s, p) => s + (p.balance?.remaining ?? 0), 0) || 0) * 100) / 100
+      const avg = data.providers?.length
+    ? Math.round((data.providers
+        .filter(p => p.balance?.available !== false)
+        .reduce((s, p) => s + (p.balance?.remaining ?? 0), 0)
+      / data.providers.filter(p => p.balance?.available !== false).length || 0) * 100) / 100
+    : 0
       label.textContent = `余额 ${fmt(avg, 2)}`
     }
   } catch (e) {
@@ -206,6 +216,7 @@ function showSetBalance(providerId, mode, data) {
   const curBal = existing?.balance
   const name = existing?.name || providerId
   const curVal = mode === 'custom' ? (curBal?.total ?? '') : ''
+  const defaultCur = curBal?.currency || 'USD'
   const dlg = document.createElement('div')
   dlg.className = 'dlg'
   dlg.innerHTML = `
@@ -216,8 +227,8 @@ function showSetBalance(providerId, mode, data) {
         <label>当前余额 <input id="dlg-bal" type="number" step="0.01" value="${esc(String(curVal))}" placeholder="输入当前余额"></label>
         <label>货币
           <select id="dlg-cur">
-            <option value="USD" ${String(curVal).includes('CNY') ? '' : 'selected'}>USD</option>
-            <option value="CNY" ${String(curVal).includes('CNY') ? 'selected' : ''}>CNY</option>
+            <option value="USD" ${defaultCur === 'USD' ? 'selected' : ''}>USD</option>
+            <option value="CNY" ${defaultCur === 'CNY' ? 'selected' : ''}>CNY</option>
           </select>
         </label>
         <div class="dlg-hint">${mode === 'custom' ? '重置后将重新计算已耗费用' : '自定义余额将在本设备本地记账中使用'}</div>
