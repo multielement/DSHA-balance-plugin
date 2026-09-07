@@ -81,13 +81,15 @@ export function ensureStateSync(file) {
 }
 
 // ================================================================
-// 异步缓存（单 key 单 promise，带 TTL）
+// 异步缓存（单 key 单 promise，带 TTL；失败自动出队允许重试）
 // ================================================================
 const _cache = new Map()
 export function cachedAsync(fn, key, ttlMs) {
   const entry = _cache.get(key)
   if (entry && Date.now() - entry.ts < ttlMs) return entry.val
-  const p = fn().then(v => { _cache.set(key, { val: v, ts: Date.now() }) })
+  const p = fn()
+    .then(v => { _cache.set(key, { val: v, ts: Date.now() }); return v })
+    .catch(e => { _cache.delete(key); throw e })  // 失败即出队，下次调用重新发起请求
   _cache.set(key, { val: p, ts: Date.now() })
   return p
 }
@@ -394,17 +396,19 @@ export function apply(ctx) {
 
   async function buildSummary(bustAll = false) {
     const state = ensureStateSync(stateFilePath)
-    const results = []
-    for (const p of providers) {
-      const bal = await probeBalance(p, bustAll || false)
-      const price = await probePricing(p, bustAll || false)
+    // 并行探测所有供应商，单家失败降级为 available:false 而不阻塞整体
+    const results = await Promise.all(providers.map(async p => {
+      const [bal, price] = await Promise.all([
+        probeBalance(p, bustAll).catch(e => ({ mode: 'auto', available: false, error: e.message, source: p.isOfficial ? 'deepseek' : 'relay' })),
+        probePricing(p, bustAll).catch(() => null)
+      ])
       const usage = state.usage[p.id] || { todayKey: '', todayCalls: 0, todayTokens: 0, todayCost: 0, total: {}, models: {} }
       const books = state.books[p.id] || { spent: 0, currency: 'USD', updatedAt: '' }
-      results.push({
+      return {
         id: p.id, name: p.name, host: p.host, isOfficial: p.isOfficial,
         credential: p.credential, balance: bal, pricing: price, usage, books
-      })
-    }
+      }
+    }))
     return { ok: true, now: nowIso(), providers: results }
   }
 
@@ -497,11 +501,6 @@ export function apply(ctx) {
         await sendJson(res, { ok: true })
       } catch (e) { await sendJson(res, { ok: false, error: e.message }) }
     } else { await sendJson(res, { ok: false, error: 'method not allowed' }, 405) }
-  }
-
-  async function handleUsage(req, res) {
-    const state = ensureStateSync(stateFilePath)
-    await sendJson(res, state.usage || {})
   }
 
   // ============================================================
