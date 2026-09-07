@@ -21,7 +21,6 @@ export const BALANCE_TTL_MS = 60_000
 export const PRICING_TTL_MS = 600_000
 export const STATE_KEY = 'dsh-provider-balance.json'
 export const DEFAULT_CUSTOM_CURRENCY_RELAY = 'USD'
-export const DEFAULT_CUSTOM_CURRENCY_OFFICIAL = 'CNY'
 
 // 解析 lib 目录绝对路径
 const _libDir = path.dirname(fileURLToPath(import.meta.url))
@@ -34,7 +33,6 @@ const _panelCssPath = path.join(_libDir, 'panel.css')
 
 export function nowIso() { return new Date().toISOString() }
 export function todayKey() { return new Date().toISOString().slice(0, 10) }
-export function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)) }
 export function roundMoney(v, n = 2) { return Math.round(v * 10 ** n) / 10 ** n }
 export function hostFromUrl(urlStr) {
   try { const u = new URL(urlStr); return u.host } catch { return String(urlStr) }
