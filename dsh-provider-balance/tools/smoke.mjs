@@ -200,6 +200,36 @@ describe('dsh-provider-balance — 核心逻辑冒烟测试', () => {
         await new Promise(r => server.close(r))
       }
     })
+
+    it('中转站异常成功响应会报告格式错误', async () => {
+      const server = http.createServer((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify(req.url.includes('subscription') ? {} : { total_usage: 'invalid' }))
+      })
+      await new Promise(r => server.listen(0, '127.0.0.1', r))
+      try {
+        await assert.rejects(
+          fetchRelayBalance(`http://127.0.0.1:${server.address().port}`, 'token'),
+          /缺少有效额度/
+        )
+      } finally {
+        await new Promise(r => server.close(r))
+      }
+    })
+
+    it('中转站合法零额度保持可用', async () => {
+      const server = http.createServer((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify(req.url.includes('subscription') ? { hard_limit_usd: 0 } : { total_usage: 0 }))
+      })
+      await new Promise(r => server.listen(0, '127.0.0.1', r))
+      try {
+        const balance = await fetchRelayBalance(`http://127.0.0.1:${server.address().port}`, 'token')
+        assert.deepStrictEqual({ total: balance.total, used: balance.used, remaining: balance.remaining }, { total: 0, used: 0, remaining: 0 })
+      } finally {
+        await new Promise(r => server.close(r))
+      }
+    })
   })
 
   describe('estimateCostFromUsage', () => {

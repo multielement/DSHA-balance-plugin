@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url'
 // ================================================================
 export const PLUGIN_ID = 'dsh-provider-balance'
 export const PLUGIN_NAME = '供应商余额管家'
-export const PLUGIN_VERSION = '1.1.5'
+export const PLUGIN_VERSION = '1.1.6'
 
 // DSH 插件加载契约：必须导出小写 name / inject（loader 读取 entry.options.name）
 // 仅声明必需服务，缺失的会被置 null（collectProviders 已做容错）
@@ -209,8 +209,16 @@ export async function fetchRelayBalance(baseURL, apiKey) {
     fetchJson(`${base}/v1/dashboard/billing/subscription`, { headers: auth, timeout: 8000 }),
     fetchJson(`${base}/v1/dashboard/billing/usage?start_date=2000-01-01&end_date=2099-01-01`, { headers: auth, timeout: 8000 })
   ])
-  const hard = Number(sub?.hard_limit_usd ?? sub?.system_hard_limit_usd ?? 0)
-  const used = Number(usage?.total_usage ?? 0)  // 单位：美分
+  const hardValue = sub?.hard_limit_usd ?? sub?.system_hard_limit_usd
+  const usedValue = usage?.total_usage
+  const hard = Number(hardValue)
+  const used = Number(usedValue)  // 单位：美分
+  if (hardValue == null || !Number.isFinite(hard)) {
+    throw Object.assign(new Error('subscription 响应缺少有效额度'), { response: sub })
+  }
+  if (usedValue == null || !Number.isFinite(used)) {
+    throw Object.assign(new Error('usage 响应缺少有效用量'), { response: usage })
+  }
   const remaining = roundMoney(hard - used / 100)
   return { total: roundMoney(hard), used: roundMoney(used / 100), remaining, currency: 'USD', updatedAt: nowIso() }
 }
