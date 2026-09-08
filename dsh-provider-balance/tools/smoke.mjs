@@ -222,6 +222,16 @@ describe('dsh-provider-balance — 核心逻辑冒烟测试', () => {
       assert.strictEqual(estimateCostFromUsage(null, {}, 'm'), null)
     })
 
+    it('未知模型返回 null，避免使用虚构的默认倍率', () => {
+      const pricing = { items: [{ model: 'known', billing: 'per-token', groupRatio: 1, inputRatio: 1, completionRatio: 1 }] }
+      assert.strictEqual(estimateCostFromUsage(pricing, { inputTokens: 500_000 }, 'unknown'), null)
+    })
+
+    it('零分组倍率保持免费计费', () => {
+      const pricing = { items: [{ model: 'free', billing: 'per-call', perCall: 1, groupRatio: 0 }] }
+      assert.strictEqual(estimateCostFromUsage(pricing, {}, 'free').cost, 0)
+    })
+
     it('缓存 token 被计入', () => {
       const pricing = { items: [{ model: 'm', billing: 'per-token', groupRatio: 1, inputRatio: 1, completionRatio: 1 }] }
       const withCache = estimateCostFromUsage(pricing, { inputTokens: 1000, cacheReadTokens: 1000, outputTokens: 0 }, 'm')
@@ -439,6 +449,25 @@ describe('dsh-provider-balance — 核心逻辑冒烟测试', () => {
       assert.strictEqual(usage.todayTokens, 500_000)
       assert.strictEqual(usage.todayCost, 1)
       assert.strictEqual(usage.models.m.cost, 1)
+      tracker.stop()
+    })
+
+    it('未知模型价格补充后只补算一次成本', () => {
+      const { ctx, handlers } = mkCtx()
+      const f = path.join(tmpDir, 'tracker-unknown-model.json')
+      const providers = [{
+        id: 'p-unknown',
+        pricing: { items: [{ model: 'known', billing: 'per-token', inputRatio: 1, completionRatio: 1, groupRatio: 1 }] }
+      }]
+      const tracker = createUsageTracker(ctx, f, () => {}, () => providers)
+      handlers['session/event']({ id: 's-unknown' }, mkEvent('p-unknown', 'new-model', { inputTokens: 500_000 }))
+      assert.strictEqual(ensureStateSync(f).usage['p-unknown'].todayCost, 0)
+      providers[0].pricing.overrides = {
+        'new-model': { billing: 'per-token', inputRatio: 1, completionRatio: 1, groupRatio: 1 }
+      }
+      assert.strictEqual(tracker.flushPendingCosts(), 1)
+      assert.strictEqual(tracker.flushPendingCosts(), 0)
+      assert.strictEqual(ensureStateSync(f).usage['p-unknown'].todayCost, 1)
       tracker.stop()
     })
 

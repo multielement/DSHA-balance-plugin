@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url'
 // ================================================================
 export const PLUGIN_ID = 'dsh-provider-balance'
 export const PLUGIN_NAME = '供应商余额管家'
-export const PLUGIN_VERSION = '1.1.4'
+export const PLUGIN_VERSION = '1.1.5'
 
 // DSH 插件加载契约：必须导出小写 name / inject（loader 读取 entry.options.name）
 // 仅声明必需服务，缺失的会被置 null（collectProviders 已做容错）
@@ -251,19 +251,20 @@ export function estimateCostFromUsage(pricing, usage, model, attribution) {
   // 支持 overrides 覆盖
   const overrides = pricing.overrides || {}
   const p = overrides[model] || pricing.items?.find(i => i.model === model) || null
+  if (!p) return null
   const input = Number(usage?.inputTokens || 0)
   const output = Number(usage?.outputTokens || 0)
   const reasoning = Number(usage?.reasoningTokens || 0)
   const cacheRead = Number(usage?.cacheReadTokens || 0)
   if (p?.billing === 'per-call') {
-    const price = (p.perCall || 0) * (p.groupRatio || 1)
+    const price = (p.perCall ?? 0) * (p.groupRatio ?? 1)
     // 单价可能低于 0.005（如 $0.001/次），保留 6 位小数避免抹零
     return { cost: roundMoney(price, 6), currency: 'USD' }
   }
   // per-token: 按 one-api 约定 $1 = 500000 quota
   // 缓存 token 保守地按全价计入
-  const rate = p ? p.inputRatio * p.groupRatio : 1
-  const cr = p ? p.completionRatio : 1
+  const rate = (p.inputRatio ?? 1) * (p.groupRatio ?? 1)
+  const cr = p.completionRatio ?? 1
   const cost = roundMoney(((input + cacheRead) * rate + (output + reasoning) * rate * cr) / ONE_API_QUOTA_PER_USD, 6)
   return { cost, currency: 'USD' }
 }
@@ -347,13 +348,14 @@ export function createUsageTracker(ctx, stateFilePath, onUpdated, providersRef =
     if (!provider?.pricing) return null
     const modelPricing = provider.pricing.overrides?.[model] || provider.pricing.items?.find(i => i.model === model)
     if (modelPricing?.billing === 'per-call' && !countCall) return 0
-    return estimateCostFromUsage(provider.pricing, {
+    const estimated = estimateCostFromUsage(provider.pricing, {
       inputTokens: delta.input,
       outputTokens: delta.output,
       cacheReadTokens: delta.cacheRead,
       cacheWriteTokens: delta.cacheWrite,
       reasoningTokens: delta.reasoning
-    }, model, 'session/event')?.cost ?? 0
+    }, model, 'session/event')
+    return estimated?.cost ?? null
   }
 
   function addCost(state, providerId, model, cost, dateKey = todayKey()) {
