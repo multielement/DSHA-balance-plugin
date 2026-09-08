@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url'
 // ================================================================
 export const PLUGIN_ID = 'dsh-provider-balance'
 export const PLUGIN_NAME = '供应商余额管家'
-export const PLUGIN_VERSION = '1.1.2'
+export const PLUGIN_VERSION = '1.1.3'
 
 // DSH 插件加载契约：必须导出小写 name / inject（loader 读取 entry.options.name）
 // 仅声明必需服务，缺失的会被置 null（collectProviders 已做容错）
@@ -84,13 +84,20 @@ export function stateFile() {
 
 export function writeStateSync(file, obj) {
   // 首次运行时 $DSH_HOME 目录可能不存在，写入前先确保父目录已创建
-  try { fs.mkdirSync(path.dirname(file), { recursive: true }) } catch {}
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  const tmp = `${file}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`
+  let fd
   try {
-    const tmp = file + '.tmp'
-    fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), 'utf8')
+    fd = fs.openSync(tmp, 'wx')
+    fs.writeFileSync(fd, JSON.stringify(obj, null, 2), 'utf8')
+    fs.fsyncSync(fd)
+    fs.closeSync(fd)
+    fd = undefined
     fs.renameSync(tmp, file)
   } catch (e) {
-    fs.writeFileSync(file, JSON.stringify(obj, null, 2), 'utf8')
+    if (fd !== undefined) fs.closeSync(fd)
+    try { fs.unlinkSync(tmp) } catch {}
+    throw e
   }
 }
 
@@ -330,6 +337,7 @@ export async function collectProviders(ctx) {
  */
 export function createUsageTracker(ctx, stateFilePath, onUpdated, providersRef = null) {
   const prev = new Map()  // bucketKey → {provider, model, usage}
+  const evicted = new Set()
   function bucketKey(sid, turn, step, provider, model) { return `${sid}|${turn}|${step}|${provider}|${model}` }
 
   function applyDelta(providerId, model, delta, countCall) {
@@ -360,7 +368,7 @@ export function createUsageTracker(ctx, stateFilePath, onUpdated, providersRef =
     // 估算成本并更新 usage.todayCost 和 books.spent
     let estimatedCost = 0
     try {
-      const currentProviders = providersRef || []
+      const currentProviders = typeof providersRef === 'function' ? providersRef() : (providersRef || [])
       const provider = currentProviders.find(p => p.id === providerId)
       if (provider?.pricing) {
         const modelPricing = provider.pricing.overrides?.[model] || provider.pricing.items?.find(i => i.model === model)
@@ -439,8 +447,17 @@ export function createUsageTracker(ctx, stateFilePath, onUpdated, providersRef =
       } else {
         delta = cur
       }
+      if (!prevEntry && evicted.delete(key)) {
+        prev.set(key, { provider, model, usage: cur, at: Date.now() })
+        return
+      }
       prev.set(key, { provider, model, usage: cur, at: Date.now() })
-      if (prev.size > 10_000) prev.delete(prev.keys().next().value)
+      if (prev.size > 10_000) {
+        const oldestKey = prev.keys().next().value
+        prev.delete(oldestKey)
+        evicted.add(oldestKey)
+        if (evicted.size > 10_000) evicted.delete(evicted.keys().next().value)
+      }
       if (Object.values(delta).every(v => v <= 0)) return
       applyDelta(provider, model, delta, !prevEntry)
     } catch (e) {
@@ -453,6 +470,7 @@ export function createUsageTracker(ctx, stateFilePath, onUpdated, providersRef =
     stop: () => {
       if (typeof dispose === 'function') dispose()
       prev.clear()
+      evicted.clear()
     }
   }
 }
@@ -467,6 +485,7 @@ export function apply(ctx) {
   let lastSummary = null
   let stopUsageTracker = () => {}
   let disposed = false
+  let summaryGeneration = 0
   const disposers = []
   const subscribers = new Set()
 
@@ -528,14 +547,15 @@ export function apply(ctx) {
     }, cacheKey, PRICING_TTL_MS)
   }
 
-  async function buildSummary(bustAll = false) {
+  async function buildSummary(bustAll = false, commit = false) {
+    const generation = ++summaryGeneration
+    const providerSnapshot = [...providers]
     // 并行探测所有供应商，单家失败降级为 available:false 而不阻塞整体
-    const probed = await Promise.all(providers.map(async p => {
+    const probed = await Promise.all(providerSnapshot.map(async p => {
       const [bal, price] = await Promise.all([
         probeBalance(p, bustAll).catch(e => ({ mode: 'auto', available: false, error: e.message, source: p.isOfficial ? 'deepseek' : 'relay' })),
         probePricing(p, bustAll).catch(() => null)
       ])
-      p.pricing = price
       return { provider: p, balance: bal, pricing: price }
     }))
     // 探测可能持续数秒，完成后读取最新状态，避免覆盖期间到达的用量事件。
@@ -548,16 +568,20 @@ export function apply(ctx) {
         credential: p.credential, balance: bal, pricing: price, usage, books
       }
     })
-    return { ok: true, now: nowIso(), providers: results }
+    const summary = { ok: true, now: nowIso(), providers: results }
+    if (generation === summaryGeneration && !disposed) {
+      for (const { provider, pricing } of probed) provider.pricing = pricing
+      if (commit) lastSummary = summary
+    }
+    return summary
   }
 
   async function init() {
+    stopUsageTracker = createUsageTracker(ctx, stateFilePath, () => { lastSummary = null }, () => providers).stop
     try { providers = await collectProviders(ctx) } catch (e) { console.error('[provider-balance] collectProviders failed:', e) }
     if (disposed) return
-    lastSummary = await buildSummary()
+    await buildSummary(false, true)
     if (disposed) return
-    stopUsageTracker = createUsageTracker(ctx, stateFilePath, () => { lastSummary = null }, providers).stop
-    if (disposed) stopUsageTracker()
     console.log(`[${PLUGIN_ID}] ready — providers=${providers.length}`)
   }
   init().catch(e => console.error('[provider-balance] init failed:', e))
@@ -581,6 +605,7 @@ export function apply(ctx) {
         reject(error)
       }
       req.on('data', chunk => {
+        if (settled) return
         size += chunk.length
         if (size > MAX_BODY_BYTES) {
           fail(Object.assign(new Error('请求体过大'), { status: 413 }))
@@ -625,9 +650,11 @@ export function apply(ctx) {
         invalidateCached(`${cacheNamespace}bal_`)
         invalidateCached(`${cacheNamespace}price_`)
       }
-      lastSummary = await buildSummary()
-      for (const cb of subscribers) { try { cb(lastSummary) } catch {} }
-      await sendJson(res, lastSummary)
+      const summary = await buildSummary(false, true)
+      if (summary === lastSummary) {
+        for (const cb of subscribers) { try { cb(summary) } catch {} }
+      }
+      await sendJson(res, summary)
     } catch (e) {
       console.error(`[${PLUGIN_ID}] refresh failed:`, e.message)
       await sendJson(res, { ok: false, error: e.message }, e.status || 500)
@@ -724,7 +751,9 @@ export function apply(ctx) {
   if (typeof ctx.effect === 'function') {
     ctx.effect(() => () => {
       disposed = true
+      summaryGeneration += 1
       invalidateCached(cacheNamespace)
+      subscribers.clear()
       for (const d of disposers) {
         try { d() } catch {}
       }

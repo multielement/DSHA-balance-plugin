@@ -243,6 +243,7 @@ describe('dsh-provider-balance — 核心逻辑冒烟测试', () => {
       const r = readStateSync(f)
       assert.deepStrictEqual(r, { a: 1, b: [2, 3] })
       assert.ok(!fs.existsSync(f + '.tmp'), 'tmp file should be renamed away')
+      assert.ok(!fs.readdirSync(path.dirname(f)).some(name => name.startsWith(`${path.basename(f)}.`) && name.endsWith('.tmp')), 'unique tmp file should be renamed away')
     })
 
     it('ensureStateSync 返回默认结构', () => {
@@ -537,6 +538,7 @@ describe('dsh-provider-balance — 核心逻辑冒烟测试', () => {
         effect: (setup) => { effectCleanup = setup() }
       }
       apply(ctx)
+      assert.strictEqual(listenerCount, 1, 'usage listener should be active while provider discovery is pending')
       effectCleanup()
       finishDescribe([])
       await new Promise(resolve => setImmediate(resolve))

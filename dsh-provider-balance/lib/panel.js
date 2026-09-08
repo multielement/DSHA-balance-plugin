@@ -6,6 +6,7 @@
 const API_BASE = '/dsh-provider-balance'
 let lastData = null
 let pollTimer = null
+let pollAbort = null
 let refreshAbort = null
 let requestSequence = 0
 
@@ -149,8 +150,7 @@ function mount() {
   pill.addEventListener('click', () => {
     panel.classList.toggle('hidden')
     if (!panel.classList.contains('hidden')) {
-      poll()
-      if (!pollTimer) pollTimer = setInterval(poll, 60_000)
+      startPolling()
     }
   })
 }
@@ -164,9 +164,13 @@ function renderLatest(data, sequence) {
 }
 
 async function poll() {
+  mount()
+  pollAbort?.abort()
+  const controller = new AbortController()
+  pollAbort = controller
   const sequence = ++requestSequence
   try {
-    const res = await fetch(`${API_BASE}/summary.json`)
+    const res = await fetch(`${API_BASE}/summary.json`, { signal: controller.signal })
     const data = await res.json()
     if (!renderLatest(data, sequence)) return
     const dot = document.querySelector('#dsh-pb-pill-dot')
@@ -186,9 +190,13 @@ async function poll() {
         : '不可用'
     }
   } catch (e) {
+    if (e.name === 'AbortError') return
     console.error('[dsh-pb] poll error:', e)
     const dot = document.querySelector('#dsh-pb-pill-dot')
     if (dot) dot.className = 'dot err'
+  } finally {
+    if (pollAbort === controller) pollAbort = null
+    if (pollTimer === true) pollTimer = setTimeout(poll, 60_000)
   }
 }
 
@@ -293,19 +301,26 @@ function showSetBalance(providerId, mode, data) {
 // 启动
 // ================================================================
 let started = false
+function startPolling() {
+  if (pollTimer) return
+  pollTimer = true
+  poll()
+}
+
 function start() {
   mount()
-  if (started) { if (!pollTimer) pollTimer = setInterval(poll, 60_000); return }
+  if (started) { startPolling(); return }
   started = true
-  poll()
-  pollTimer = setInterval(poll, 60_000)
+  startPolling()
 }
 
 function stopPolling() {
-  if (pollTimer) {
-    clearInterval(pollTimer)
-    pollTimer = null
-  }
+  if (pollTimer !== true) clearTimeout(pollTimer)
+  pollTimer = null
+  pollAbort?.abort()
+  pollAbort = null
+  refreshAbort?.abort()
+  refreshAbort = null
 }
 
 if (document.readyState === 'loading') {
