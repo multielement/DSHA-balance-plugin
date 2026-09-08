@@ -44,13 +44,13 @@
 ### 方式一：npm 安装（推荐）
 
 ```bash
-dsha-plugin install dsh-provider-balance@1.2.1
+dsha-plugin install dsh-provider-balance@1.2.2
 ```
 
 或本地路径：
 
 ```bash
-dsha-plugin install /workspace/dsh-provider-balance/dsh-provider-balance-1.2.1.tgz
+dsha-plugin install /workspace/dsh-provider-balance/dsh-provider-balance-1.2.2.tgz
 ```
 
 ### 方式二：GitHub 仓库链接

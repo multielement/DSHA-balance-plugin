@@ -486,6 +486,27 @@ describe('dsh-provider-balance — 核心逻辑冒烟测试', () => {
       tracker.stop()
     })
 
+    it('重复日期归档会合并已有历史而非覆盖', () => {
+      const { ctx, handlers } = mkCtx()
+      const f = path.join(tmpDir, 'tracker-archive-conflict.json')
+      const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10)
+      const state = ensureStateSync(f)
+      state.usage.p = {
+        todayKey: yesterday,
+        todayCalls: 2,
+        todayTokens: 20,
+        todayCost: 0.2,
+        models: { m: { calls: 2, tokens: 20, cost: 0.2 } },
+        [`${yesterday}_done`]: { calls: 3, tokens: 30, cost: 0.3, models: { m: { calls: 3, tokens: 30, cost: 0.3 } } }
+      }
+      writeStateSync(f, state)
+      const tracker = createUsageTracker(ctx, f, () => {}, [])
+      handlers['session/event']({ id: 's-archive-conflict' }, mkEvent('p', 'm', { inputTokens: 1 }))
+      const saved = ensureStateSync(f).usage.p[`${yesterday}_done`]
+      assert.deepStrictEqual(saved, { calls: 5, tokens: 50, cost: 0.5, models: { m: { calls: 5, tokens: 50, cost: 0.5 } } })
+      tracker.stop()
+    })
+
     it('支持 DSHA 1.2+ 事件：provider/model 仅从 message.source 提取', () => {
       const { ctx, handlers } = mkCtx()
       const f = path.join(tmpDir, 'tracker-v2.json')

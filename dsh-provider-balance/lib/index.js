@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url'
 // ================================================================
 export const PLUGIN_ID = 'dsh-provider-balance'
 export const PLUGIN_NAME = '供应商余额管家'
-export const PLUGIN_VERSION = '1.2.1'
+export const PLUGIN_VERSION = '1.2.2'
 
 // DSH 插件加载契约：必须导出小写 name / inject（loader 读取 entry.options.name）
 // 仅声明必需服务，缺失的会被置 null（collectProviders 已做容错）
@@ -409,7 +409,22 @@ export function createUsageTracker(ctx, stateFilePath, onUpdated, providersRef =
     const bucket = state.usage[providerId]
     if (bucket.todayKey !== tk) {
       const histKey = `${bucket.todayKey}_done`
-      bucket[histKey] = { calls: bucket.todayCalls, tokens: bucket.todayTokens, cost: bucket.todayCost, models: bucket.models }
+      const previous = bucket[histKey] || { calls: 0, tokens: 0, cost: 0, models: {} }
+      const models = { ...(previous.models || {}) }
+      for (const [name, current] of Object.entries(bucket.models || {})) {
+        const old = models[name] || { calls: 0, tokens: 0, cost: 0 }
+        models[name] = {
+          calls: (old.calls || 0) + (current.calls || 0),
+          tokens: (old.tokens || 0) + (current.tokens || 0),
+          cost: roundMoney((old.cost || 0) + (current.cost || 0), 6)
+        }
+      }
+      bucket[histKey] = {
+        calls: (previous.calls || 0) + bucket.todayCalls,
+        tokens: (previous.tokens || 0) + bucket.todayTokens,
+        cost: roundMoney((previous.cost || 0) + bucket.todayCost, 6),
+        models
+      }
       bucket.todayKey = tk
       bucket.todayCalls = 0
       bucket.todayTokens = 0
