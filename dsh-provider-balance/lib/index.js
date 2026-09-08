@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url'
 // ================================================================
 export const PLUGIN_ID = 'dsh-provider-balance'
 export const PLUGIN_NAME = '供应商余额管家'
-export const PLUGIN_VERSION = '1.1.1'
+export const PLUGIN_VERSION = '1.1.2'
 
 // DSH 插件加载契约：必须导出小写 name / inject（loader 读取 entry.options.name）
 // 仅声明必需服务，缺失的会被置 null（collectProviders 已做容错）
@@ -42,6 +42,7 @@ export const DEEPSEEK_BUILTIN_PRICING = {
 
 /** 用量历史保留天数（超过的日归档 bucket 会被裁剪，防止状态文件膨胀） */
 export const HISTORY_RETENTION_DAYS = 30
+export const MAX_BODY_BYTES = 64 * 1024
 
 // 解析 lib 目录绝对路径
 const _libDir = path.dirname(fileURLToPath(import.meta.url))
@@ -98,13 +99,26 @@ export function readStateSync(file) {
 }
 
 export function ensureStateSync(file) {
-  return readStateSync(file) || { version: 1, custom: {}, books: {}, usage: {}, seenProviders: [] }
+  const state = readStateSync(file)
+  if (!state || typeof state !== 'object' || Array.isArray(state)) {
+    return { version: 1, custom: {}, books: {}, usage: {}, overrides: {}, seenProviders: [] }
+  }
+  return {
+    ...state,
+    version: Number.isFinite(state.version) ? state.version : 1,
+    custom: state.custom && typeof state.custom === 'object' && !Array.isArray(state.custom) ? state.custom : {},
+    books: state.books && typeof state.books === 'object' && !Array.isArray(state.books) ? state.books : {},
+    usage: state.usage && typeof state.usage === 'object' && !Array.isArray(state.usage) ? state.usage : {},
+    overrides: state.overrides && typeof state.overrides === 'object' && !Array.isArray(state.overrides) ? state.overrides : {},
+    seenProviders: Array.isArray(state.seenProviders) ? state.seenProviders : []
+  }
 }
 
 // ================================================================
 // 异步缓存（单 key 单 promise，带 TTL；失败自动出队允许重试）
 // ================================================================
 const _cache = new Map()
+let _cacheInstanceId = 0
 export function cachedAsync(fn, key, ttlMs) {
   const entry = _cache.get(key)
   if (entry && Date.now() - entry.ts < ttlMs) return entry.val
@@ -160,7 +174,7 @@ export async function fetchJson(urlStr, opts = {}) {
  * DeepSeek 官方 /user/balance（返回 balance_infos[]）
  */
 export async function fetchDeepSeekBalance(baseURL, apiKey) {
-  const base = (baseURL || 'https://api.deepseek.com').replace(/\/$/, '')
+  const base = (baseURL || 'https://api.deepseek.com').replace(/\/$/, '').replace(/\/v1$/i, '')
   const res = await fetchJson(`${base}/user/balance`, {
     headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' }
   })
@@ -169,6 +183,7 @@ export async function fetchDeepSeekBalance(baseURL, apiKey) {
   if (!pick) throw Object.assign(new Error('balance_infos 为空'), { infos })
   return {
     total: Number(pick.total_balance ?? 0),
+    remaining: Number(pick.total_balance ?? 0),
     granted: Number(pick.granted_balance ?? 0),
     toppedUp: Number(pick.topped_up_balance ?? 0),
     currency: (pick.currency || 'CNY').toUpperCase(),
@@ -180,7 +195,7 @@ export async function fetchDeepSeekBalance(baseURL, apiKey) {
  * one-api / new-api 中转站：硬额度 - 已用 = 余额（单位 USD，total_usage 为美分）
  */
 export async function fetchRelayBalance(baseURL, apiKey) {
-  const base = (baseURL || '').replace(/\/$/, '')
+  const base = (baseURL || '').replace(/\/$/, '').replace(/\/v1$/i, '')
   if (!base) throw Object.assign(new Error('baseURL 缺失'), { key: 'baseURL' })
   const auth = { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' }
   const [sub, usage] = await Promise.all([
@@ -315,7 +330,7 @@ export async function collectProviders(ctx) {
  */
 export function createUsageTracker(ctx, stateFilePath, onUpdated, providersRef = null) {
   const prev = new Map()  // bucketKey → {provider, model, usage}
-  function bucketKey(sid, turn, step) { return `${sid}|${turn}|${step}` }
+  function bucketKey(sid, turn, step, provider, model) { return `${sid}|${turn}|${step}|${provider}|${model}` }
 
   function applyDelta(providerId, model, delta, countCall) {
     const tk = todayKey()
@@ -348,14 +363,17 @@ export function createUsageTracker(ctx, stateFilePath, onUpdated, providersRef =
       const currentProviders = providersRef || []
       const provider = currentProviders.find(p => p.id === providerId)
       if (provider?.pricing) {
-        // delta 字段与 estimateCostFromUsage 的 TokenUsage schema 对齐
-        const { cost } = estimateCostFromUsage(provider.pricing, {
-          inputTokens: delta.input,
-          outputTokens: delta.output,
-          cacheReadTokens: delta.cacheRead,
-          cacheWriteTokens: delta.cacheWrite,
-          reasoningTokens: delta.reasoning
-        }, model, 'session/event')
+        const modelPricing = provider.pricing.overrides?.[model] || provider.pricing.items?.find(i => i.model === model)
+        // 按次价格只在首个增量计费；token 增量仍持续累计。
+        const cost = modelPricing?.billing === 'per-call' && !countCall
+          ? 0
+          : estimateCostFromUsage(provider.pricing, {
+              inputTokens: delta.input,
+              outputTokens: delta.output,
+              cacheReadTokens: delta.cacheRead,
+              cacheWriteTokens: delta.cacheWrite,
+              reasoningTokens: delta.reasoning
+            }, model, 'session/event')?.cost
         if (cost != null && cost > 0) {
           estimatedCost = cost
           // 保留 6 位小数，避免 per-call 微额计价被 roundMoney(2) 抹零
@@ -400,7 +418,7 @@ export function createUsageTracker(ctx, stateFilePath, onUpdated, providersRef =
       if (!usage) return
       const turn = event.data?.turn ?? 0
       const step = event.data?.step ?? 0
-      const key = bucketKey(sessionId, turn, step)
+      const key = bucketKey(sessionId, turn, step, provider, model)
       const prevEntry = prev.get(key)
       const cur = {
         input: Number(usage.inputTokens || 0),
@@ -412,18 +430,18 @@ export function createUsageTracker(ctx, stateFilePath, onUpdated, providersRef =
       let delta
       if (prevEntry) {
         delta = {
-          input: cur.input - (prevEntry.usage?.input || 0),
-          output: cur.output - (prevEntry.usage?.output || 0),
-          cacheRead: cur.cacheRead - (prevEntry.usage?.cacheRead || 0),
-          cacheWrite: cur.cacheWrite - (prevEntry.usage?.cacheWrite || 0),
-          reasoning: cur.reasoning - (prevEntry.usage?.reasoning || 0)
+          input: Math.max(0, cur.input - (prevEntry.usage?.input || 0)),
+          output: Math.max(0, cur.output - (prevEntry.usage?.output || 0)),
+          cacheRead: Math.max(0, cur.cacheRead - (prevEntry.usage?.cacheRead || 0)),
+          cacheWrite: Math.max(0, cur.cacheWrite - (prevEntry.usage?.cacheWrite || 0)),
+          reasoning: Math.max(0, cur.reasoning - (prevEntry.usage?.reasoning || 0))
         }
       } else {
         delta = cur
       }
-      if (Object.values(delta).every(v => v <= 0)) return
       prev.set(key, { provider, model, usage: cur, at: Date.now() })
       if (prev.size > 10_000) prev.delete(prev.keys().next().value)
+      if (Object.values(delta).every(v => v <= 0)) return
       applyDelta(provider, model, delta, !prevEntry)
     } catch (e) {
       console.error('[provider-balance] usage tracking error:', e)
@@ -444,9 +462,11 @@ export function createUsageTracker(ctx, stateFilePath, onUpdated, providersRef =
 // ================================================================
 export function apply(ctx) {
   const stateFilePath = stateFile()
+  const cacheNamespace = `instance_${++_cacheInstanceId}_`
   let providers = []
   let lastSummary = null
   let stopUsageTracker = () => {}
+  let disposed = false
   const disposers = []
   const subscribers = new Set()
 
@@ -472,7 +492,7 @@ export function apply(ctx) {
     if (provider.credential !== 'ok') {
       return { mode: 'auto', available: false, error: '未配置 API Key', source: provider.isOfficial ? 'deepseek' : 'relay' }
     }
-    const cacheKey = `bal_${provider.id}`
+    const cacheKey = `${cacheNamespace}bal_${provider.id}`
     if (bust) invalidateCached(cacheKey)
     return cachedAsync(async () => {
       const cred = await resolveProviderKey(provider)
@@ -485,7 +505,7 @@ export function apply(ctx) {
 
   async function probePricing(provider, bust = false) {
     if (provider.credential !== 'ok') return null
-    const cacheKey = `price_${provider.id}`
+    const cacheKey = `${cacheNamespace}price_${provider.id}`
     if (bust) invalidateCached(cacheKey)
     return cachedAsync(async () => {
       const overrides = ensureStateSync(stateFilePath).overrides || {}
@@ -495,9 +515,10 @@ export function apply(ctx) {
           base = DEEPSEEK_BUILTIN_PRICING
         } else if (provider.baseURL) {
           const cred = await resolveProviderKey(provider)
-          try { base = normalizeOneApiPricing(await fetchJson(`${provider.baseURL}/api/pricing`, { timeout: 6000 })) } catch {}
+          const baseURL = provider.baseURL.replace(/\/v1$/i, '')
+          try { base = normalizeOneApiPricing(await fetchJson(`${baseURL}/api/pricing`, { timeout: 6000 })) } catch {}
           if (!base) {
-            try { base = normalizeOneApiPricing(await fetchJson(`${provider.baseURL}/api/pricing`, { headers: { Authorization: `Bearer ${cred?.value ?? ''}` }, timeout: 6000 })) } catch {}
+            try { base = normalizeOneApiPricing(await fetchJson(`${baseURL}/api/pricing`, { headers: { Authorization: `Bearer ${cred?.value ?? ''}` }, timeout: 6000 })) } catch {}
           }
           if (!base) return null
         }
@@ -508,28 +529,35 @@ export function apply(ctx) {
   }
 
   async function buildSummary(bustAll = false) {
-    const state = ensureStateSync(stateFilePath)
     // 并行探测所有供应商，单家失败降级为 available:false 而不阻塞整体
-    const results = await Promise.all(providers.map(async p => {
+    const probed = await Promise.all(providers.map(async p => {
       const [bal, price] = await Promise.all([
         probeBalance(p, bustAll).catch(e => ({ mode: 'auto', available: false, error: e.message, source: p.isOfficial ? 'deepseek' : 'relay' })),
         probePricing(p, bustAll).catch(() => null)
       ])
       p.pricing = price
+      return { provider: p, balance: bal, pricing: price }
+    }))
+    // 探测可能持续数秒，完成后读取最新状态，避免覆盖期间到达的用量事件。
+    const state = ensureStateSync(stateFilePath)
+    const results = probed.map(({ provider: p, balance: bal, pricing: price }) => {
       const usage = state.usage[p.id] || { todayKey: '', todayCalls: 0, todayTokens: 0, todayCost: 0, total: {}, models: {} }
       const books = state.books[p.id] || { spent: 0, currency: 'USD', updatedAt: '' }
       return {
         id: p.id, name: p.name, host: p.host, isOfficial: p.isOfficial,
         credential: p.credential, balance: bal, pricing: price, usage, books
       }
-    }))
+    })
     return { ok: true, now: nowIso(), providers: results }
   }
 
   async function init() {
     try { providers = await collectProviders(ctx) } catch (e) { console.error('[provider-balance] collectProviders failed:', e) }
-    stopUsageTracker = createUsageTracker(ctx, stateFilePath, () => { lastSummary = null }, providers)
+    if (disposed) return
     lastSummary = await buildSummary()
+    if (disposed) return
+    stopUsageTracker = createUsageTracker(ctx, stateFilePath, () => { lastSummary = null }, providers).stop
+    if (disposed) stopUsageTracker()
     console.log(`[${PLUGIN_ID}] ready — providers=${providers.length}`)
   }
   init().catch(e => console.error('[provider-balance] init failed:', e))
@@ -545,12 +573,30 @@ export function apply(ctx) {
   function parseBody(req) {
     return new Promise((resolve, reject) => {
       let body = ''
-      req.on('data', chunk => { body += chunk })
-      req.on('end', () => {
-        try { resolve(JSON.parse(body || '{}')) }
-        catch (e) { reject(new Error('JSON 解析失败: ' + e.message)) }
+      let size = 0
+      let settled = false
+      const fail = (error) => {
+        if (settled) return
+        settled = true
+        reject(error)
+      }
+      req.on('data', chunk => {
+        size += chunk.length
+        if (size > MAX_BODY_BYTES) {
+          fail(Object.assign(new Error('请求体过大'), { status: 413 }))
+          req.resume?.()
+          return
+        }
+        body += chunk
       })
-      req.on('error', reject)
+      req.on('end', () => {
+        if (settled) return
+        settled = true
+        try { resolve(JSON.parse(body || '{}')) }
+        catch (e) { reject(Object.assign(new Error('JSON 解析失败: ' + e.message), { status: 400 })) }
+      })
+      req.on('aborted', () => fail(Object.assign(new Error('请求已中止'), { status: 400 })))
+      req.on('error', fail)
     })
   }
 
@@ -568,31 +614,32 @@ export function apply(ctx) {
   async function handleSummary(req, res) { await sendJson(res, await buildSummary()) }
 
   async function handleRefresh(req, res) {
+    if (req.method !== 'POST') return sendJson(res, { ok: false, error: 'method not allowed' }, 405)
     try {
       const body = await parseBody(req)
       const { provider } = body
       if (provider) {
-        invalidateCached(`bal_${provider}`)
-        invalidateCached(`price_${provider}`)
+        invalidateCached(`${cacheNamespace}bal_${provider}`)
+        invalidateCached(`${cacheNamespace}price_${provider}`)
       } else {
-        invalidateCached('bal_')
-        invalidateCached('price_')
+        invalidateCached(`${cacheNamespace}bal_`)
+        invalidateCached(`${cacheNamespace}price_`)
       }
       lastSummary = await buildSummary()
       for (const cb of subscribers) { try { cb(lastSummary) } catch {} }
       await sendJson(res, lastSummary)
     } catch (e) {
       console.error(`[${PLUGIN_ID}] refresh failed:`, e.message)
-      await sendJson(res, { ok: false, error: e.message })
+      await sendJson(res, { ok: false, error: e.message }, e.status || 500)
     }
   }
 
   async function handleCustom(req, res) {
-    const state = ensureStateSync(stateFilePath)
-    if (req.method === 'GET') { await sendJson(res, state.custom || {}) }
+    if (req.method === 'GET') { await sendJson(res, ensureStateSync(stateFilePath).custom) }
     else if (req.method === 'POST') {
       try {
         const body = await parseBody(req)
+        const state = ensureStateSync(stateFilePath)
         const { provider, balance, currency, resetBooks = false } = body
         if (!provider) throw new Error('provider 必填')
         if (balance == null) throw new Error('balance 必填')
@@ -609,7 +656,7 @@ export function apply(ctx) {
         await sendJson(res, { ok: true, updated: provider })
       } catch (e) {
         console.error(`[${PLUGIN_ID}] custom balance update failed:`, e.message)
-        await sendJson(res, { ok: false, error: e.message })
+        await sendJson(res, { ok: false, error: e.message }, e.status || 400)
       }
     } else { await sendJson(res, { ok: false, error: 'method not allowed' }, 405) }
   }
@@ -620,20 +667,20 @@ export function apply(ctx) {
   }
 
   async function handleOverrides(req, res) {
-    const state = ensureStateSync(stateFilePath)
-    if (req.method === 'GET') { await sendJson(res, state.overrides || {}) }
+    if (req.method === 'GET') { await sendJson(res, ensureStateSync(stateFilePath).overrides) }
     else if (req.method === 'POST') {
       try {
         const body = await parseBody(req)
+        const state = ensureStateSync(stateFilePath)
         const overrides = body
         if (typeof overrides !== 'object' || overrides === null || Array.isArray(overrides)) throw new Error('overrides 应为对象')
         state.overrides = overrides
         writeStateSync(stateFilePath, state)
         // overrides 变更后旧 pricing 缓存仍然有效 10 分钟，主动失效让修改立即生效
-        invalidateCached('price_')
+        invalidateCached(`${cacheNamespace}price_`)
         lastSummary = null
         await sendJson(res, { ok: true })
-      } catch (e) { await sendJson(res, { ok: false, error: e.message }) }
+      } catch (e) { await sendJson(res, { ok: false, error: e.message }, e.status || 400) }
     } else { await sendJson(res, { ok: false, error: 'method not allowed' }, 405) }
   }
 
@@ -676,6 +723,8 @@ export function apply(ctx) {
   // HMR/重载时清理路由和注入，避免重复注册导致 web ui 无法启动
   if (typeof ctx.effect === 'function') {
     ctx.effect(() => () => {
+      disposed = true
+      invalidateCached(cacheNamespace)
       for (const d of disposers) {
         try { d() } catch {}
       }

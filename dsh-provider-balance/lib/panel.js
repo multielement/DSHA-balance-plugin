@@ -7,6 +7,7 @@ const API_BASE = '/dsh-provider-balance'
 let lastData = null
 let pollTimer = null
 let refreshAbort = null
+let requestSequence = 0
 
 // 面板关闭时清理定时器
 window.addEventListener('beforeunload', stopPolling)
@@ -154,13 +155,20 @@ function mount() {
   })
 }
 
+function renderLatest(data, sequence) {
+  if (sequence !== requestSequence) return false
+  lastData = data
+  const panel = document.querySelector('#dsh-pb-panel')
+  if (panel) panel.innerHTML = renderPanel(data)
+  return true
+}
+
 async function poll() {
+  const sequence = ++requestSequence
   try {
     const res = await fetch(`${API_BASE}/summary.json`)
     const data = await res.json()
-    lastData = data
-    const panel = document.querySelector('#dsh-pb-panel')
-    if (panel) panel.innerHTML = renderPanel(data)
+    if (!renderLatest(data, sequence)) return
     const dot = document.querySelector('#dsh-pb-pill-dot')
     if (dot) dot.className = 'dot' + (data.ok ? '' : ' err')
     const label = document.querySelector('#dsh-pb-pill-label')
@@ -185,6 +193,7 @@ async function poll() {
 }
 
 async function refreshProvider(providerId) {
+  const sequence = ++requestSequence
   try {
     const res = await fetch(`${API_BASE}/refresh.json`, {
       method: 'POST',
@@ -192,30 +201,28 @@ async function refreshProvider(providerId) {
       body: JSON.stringify({ provider: providerId })
     })
     const data = await res.json()
-    lastData = data
-    const panel = document.querySelector('#dsh-pb-panel')
-    if (panel) panel.innerHTML = renderPanel(data)
+    renderLatest(data, sequence)
   } catch (e) { console.error('[dsh-pb] refresh provider error:', e) }
 }
 
 async function doRefresh() {
   refreshAbort?.abort()
-  refreshAbort = new AbortController()
+  const controller = new AbortController()
+  refreshAbort = controller
+  const sequence = ++requestSequence
   try {
     const res = await fetch(`${API_BASE}/refresh.json`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: '{}',
-      signal: refreshAbort.signal
+      signal: controller.signal
     })
     const data = await res.json()
-    lastData = data
-    const panel = document.querySelector('#dsh-pb-panel')
-    if (panel) panel.innerHTML = renderPanel(data)
+    renderLatest(data, sequence)
   } catch (e) {
     if (e.name !== 'AbortError') console.error('[dsh-pb] refresh error:', e)
   } finally {
-    refreshAbort = null
+    if (refreshAbort === controller) refreshAbort = null
   }
 }
 
@@ -287,9 +294,9 @@ function showSetBalance(providerId, mode, data) {
 // ================================================================
 let started = false
 function start() {
+  mount()
   if (started) { if (!pollTimer) pollTimer = setInterval(poll, 60_000); return }
   started = true
-  mount()
   poll()
   pollTimer = setInterval(poll, 60_000)
 }

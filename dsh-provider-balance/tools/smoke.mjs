@@ -19,7 +19,7 @@ import {
   pickBalanceInfo, normalizeOneApiPricing, estimateCostFromUsage,
   ONE_API_QUOTA_PER_USD,
   stateFile, writeStateSync, readStateSync, ensureStateSync,
-  collectProviders, cachedAsync, invalidateCached, fetchJson, createUsageTracker
+  collectProviders, cachedAsync, invalidateCached, fetchJson, fetchRelayBalance, createUsageTracker, apply
 } from '../lib/index.js'
 
 // 面板纯函数（复制 panel.js 核心逻辑，避免动态 ESM 导入）
@@ -173,10 +173,29 @@ describe('dsh-provider-balance — 核心逻辑冒烟测试', () => {
       await new Promise(r => server.listen(0, '127.0.0.1', r))
       try {
         const { fetchDeepSeekBalance } = await import('../lib/index.js')
-        const bal = await fetchDeepSeekBalance(`http://127.0.0.1:${server.address().port}`, 'sk-real-token')
+        const bal = await fetchDeepSeekBalance(`http://127.0.0.1:${server.address().port}/v1`, 'sk-real-token')
         assert.strictEqual(authHeader, 'Bearer sk-real-token', 'Authorization 必须是实际字符串 token')
         assert.strictEqual(bal.total, 10)
+        assert.strictEqual(bal.remaining, 10)
         assert.strictEqual(bal.currency, 'CNY')
+      } finally {
+        await new Promise(r => server.close(r))
+      }
+    })
+
+    it('中转地址以 /v1 结尾时不会重复拼接路径', async () => {
+      const paths = []
+      const server = http.createServer((req, res) => {
+        paths.push(req.url)
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify(req.url.includes('subscription') ? { hard_limit_usd: 10 } : { total_usage: 100 }))
+      })
+      await new Promise(r => server.listen(0, '127.0.0.1', r))
+      try {
+        const baseURL = `http://127.0.0.1:${server.address().port}/v1`
+        const balance = await fetchRelayBalance(baseURL, 'token')
+        assert.deepStrictEqual(paths.sort(), ['/v1/dashboard/billing/subscription', '/v1/dashboard/billing/usage?start_date=2000-01-01&end_date=2099-01-01'].sort())
+        assert.strictEqual(balance.remaining, 9)
       } finally {
         await new Promise(r => server.close(r))
       }
@@ -240,6 +259,21 @@ describe('dsh-provider-balance — 核心逻辑冒烟测试', () => {
       writeStateSync(f, { version: 1, custom: { x: { balance: 100 } } })
       const s = ensureStateSync(f)
       assert.deepStrictEqual(s.custom, { x: { balance: 100 } })
+      assert.deepStrictEqual(s.books, {})
+      assert.deepStrictEqual(s.usage, {})
+      assert.deepStrictEqual(s.overrides, {})
+      assert.deepStrictEqual(s.seenProviders, [])
+    })
+
+    it('ensureStateSync 修复类型错误的顶层字段', () => {
+      const f = path.join(tmpDir, 'malformed.json')
+      writeStateSync(f, { version: 1, custom: [], books: null, usage: 'bad', overrides: 3, seenProviders: {} })
+      const s = ensureStateSync(f)
+      assert.deepStrictEqual(s.custom, {})
+      assert.deepStrictEqual(s.books, {})
+      assert.deepStrictEqual(s.usage, {})
+      assert.deepStrictEqual(s.overrides, {})
+      assert.deepStrictEqual(s.seenProviders, [])
     })
 
     it('writeStateSync 自动创建缺失的父目录（首次运行 $DSH_HOME 不存在）', () => {
@@ -354,6 +388,41 @@ describe('dsh-provider-balance — 核心逻辑冒烟测试', () => {
       assert.ok(isDisposed(), 'stop should dispose the session/event listener')
     })
 
+    it('per-call 增量事件只扣费一次并持续累计 token', () => {
+      const { ctx, handlers } = mkCtx()
+      const f = path.join(tmpDir, 'tracker-call-delta.json')
+      const providers = [
+        { id: 'p-call-delta', pricing: { items: [{ model: 'm', billing: 'per-call', perCall: 0.5, groupRatio: 1 }] } }
+      ]
+      const tracker = createUsageTracker(ctx, f, () => {}, providers)
+      const session = { id: 's-call-delta' }
+      handlers['session/event'](session, mkEvent('p-call-delta', 'm', { inputTokens: 10, outputTokens: 5 }))
+      handlers['session/event'](session, mkEvent('p-call-delta', 'm', { inputTokens: 20, outputTokens: 10 }))
+      const usage = ensureStateSync(f).usage['p-call-delta']
+      assert.strictEqual(usage.todayCalls, 1)
+      assert.strictEqual(usage.todayTokens, 30)
+      assert.strictEqual(usage.todayCost, 0.5)
+      assert.strictEqual(usage.models.m.cost, 0.5)
+      tracker.stop()
+    })
+
+    it('计数器回退会更新基线，模型切换会创建新调用', () => {
+      const { ctx, handlers } = mkCtx()
+      const f = path.join(tmpDir, 'tracker-reset.json')
+      const tracker = createUsageTracker(ctx, f, () => {}, [])
+      const session = { id: 's-reset' }
+      handlers['session/event'](session, mkEvent('p-reset', 'm1', { inputTokens: 100, outputTokens: 50 }))
+      handlers['session/event'](session, mkEvent('p-reset', 'm1', { inputTokens: 10, outputTokens: 5 }))
+      handlers['session/event'](session, mkEvent('p-reset', 'm1', { inputTokens: 20, outputTokens: 10 }))
+      handlers['session/event'](session, mkEvent('p-reset', 'm2', { inputTokens: 7, outputTokens: 3 }))
+      const usage = ensureStateSync(f).usage['p-reset']
+      assert.strictEqual(usage.todayCalls, 2)
+      assert.strictEqual(usage.todayTokens, 175)
+      assert.strictEqual(usage.models.m1.calls, 1)
+      assert.strictEqual(usage.models.m2.calls, 1)
+      tracker.stop()
+    })
+
     it('CNY 自定义余额不直接扣减 USD 估算成本', () => {
       const { ctx, handlers } = mkCtx()
       const f = path.join(tmpDir, 'tracker-currency.json')
@@ -448,6 +517,30 @@ describe('dsh-provider-balance — 核心逻辑冒烟测试', () => {
       const p = result.find(x => x.id === 'test-p')
       assert.ok(p, 'provider should be found')
       assert.strictEqual(p.credential, 'ok', 'credential should resolve')
+    })
+  })
+
+  describe('插件生命周期', () => {
+    it('初始化完成前卸载不会遗留 session/event 监听器', async () => {
+      let finishDescribe
+      let effectCleanup
+      let listenerCount = 0
+      const ctx = {
+        llm: { listProviders: () => [] },
+        settings: { describe: () => new Promise(resolve => { finishDescribe = resolve }) },
+        credentials: { resolve: async () => null },
+        webServer: {
+          register: () => () => {},
+          tapIndex: () => () => {}
+        },
+        on: () => { listenerCount += 1; return () => { listenerCount -= 1 } },
+        effect: (setup) => { effectCleanup = setup() }
+      }
+      apply(ctx)
+      effectCleanup()
+      finishDescribe([])
+      await new Promise(resolve => setImmediate(resolve))
+      assert.strictEqual(listenerCount, 0)
     })
   })
 })
