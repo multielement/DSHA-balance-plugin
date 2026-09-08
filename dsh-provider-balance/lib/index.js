@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url'
 // ================================================================
 export const PLUGIN_ID = 'dsh-provider-balance'
 export const PLUGIN_NAME = '供应商余额管家'
-export const PLUGIN_VERSION = '1.1.6'
+export const PLUGIN_VERSION = '1.1.7'
 
 // DSH 插件加载契约：必须导出小写 name / inject（loader 读取 entry.options.name）
 // 仅声明必需服务，缺失的会被置 null（collectProviders 已做容错）

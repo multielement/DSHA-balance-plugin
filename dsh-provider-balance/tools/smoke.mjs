@@ -647,6 +647,8 @@ describe('panel.js / panel.css 文件存在性', () => {
     assert.ok(panelJs.includes('renderPanel'), 'should export renderPanel logic')
     assert.ok(panelJs.includes('dsh-provider-balance'), 'should reference API base')
     assert.ok(panelJs.includes('fetch'), 'should poll API')
+    assert.ok(panelJs.includes('AbortSignal.timeout(REQUEST_TIMEOUT_MS)'), 'all panel requests should have a timeout')
+    assert.ok(panelJs.includes('AbortSignal.any([options.signal, timeoutSignal])'), 'request timeout should compose with lifecycle abort signals')
   })
 
   it('panel.css 可读且包含关键选择器', () => {

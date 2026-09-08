@@ -4,6 +4,7 @@
 'use strict'
 
 const API_BASE = '/dsh-provider-balance'
+const REQUEST_TIMEOUT_MS = 10_000
 let lastData = null
 let pollTimer = null
 let pollingEnabled = false
@@ -28,8 +29,10 @@ function esc(s) {
   return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
 }
 
-async function fetchJson(url, options) {
-  const res = await fetch(url, options)
+async function fetchJson(url, options = {}) {
+  const timeoutSignal = AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+  const signal = options.signal ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal
+  const res = await fetch(url, { ...options, signal })
   let data
   try { data = await res.json() } catch { data = null }
   if (!res.ok) throw new Error(data?.error || `HTTP ${res.status}`)
