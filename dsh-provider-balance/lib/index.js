@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url'
 // ================================================================
 export const PLUGIN_ID = 'dsh-provider-balance'
 export const PLUGIN_NAME = '供应商余额管家'
-export const PLUGIN_VERSION = '1.1.8'
+export const PLUGIN_VERSION = '1.1.9'
 
 // DSH 插件加载契约：必须导出小写 name / inject（loader 读取 entry.options.name）
 // 仅声明必需服务，缺失的会被置 null（collectProviders 已做容错）
@@ -106,9 +106,17 @@ export function readStateSync(file) {
 }
 
 export function ensureStateSync(file) {
-  const state = readStateSync(file)
+  let state
+  try {
+    state = JSON.parse(fs.readFileSync(file, 'utf8'))
+  } catch (e) {
+    if (e?.code === 'ENOENT') {
+      return { version: 1, custom: {}, books: {}, usage: {}, overrides: {}, seenProviders: [] }
+    }
+    throw Object.assign(new Error(`状态文件读取失败: ${e.message}`), { cause: e, file })
+  }
   if (!state || typeof state !== 'object' || Array.isArray(state)) {
-    return { version: 1, custom: {}, books: {}, usage: {}, overrides: {}, seenProviders: [] }
+    throw Object.assign(new Error('状态文件格式无效'), { file })
   }
   return {
     ...state,

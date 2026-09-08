@@ -349,6 +349,14 @@ describe('dsh-provider-balance — 核心逻辑冒烟测试', () => {
       assert.deepStrictEqual(s.seenProviders, [])
     })
 
+    it('损坏的状态文件会中止读取并保留原内容', () => {
+      const f = path.join(tmpDir, 'corrupt.json')
+      const original = '{"version":1,"usage":'
+      fs.writeFileSync(f, original)
+      assert.throws(() => ensureStateSync(f), /状态文件读取失败/)
+      assert.strictEqual(fs.readFileSync(f, 'utf8'), original)
+    })
+
     it('writeStateSync 自动创建缺失的父目录（首次运行 $DSH_HOME 不存在）', () => {
       const f = path.join(tmpDir, 'a', 'b', 'state.json')
       writeStateSync(f, { ok: true })
@@ -374,6 +382,17 @@ describe('dsh-provider-balance — 核心逻辑冒烟测试', () => {
     const mkEventV2 = (provider, model, usage) => ({
       type: 'assistant/message',
       data: { message: { role: 'assistant', source: { kind: 'model', provider, model } }, turn: 0, step: 0, usage }
+    })
+
+    it('记账遇到损坏状态时不会覆盖历史文件', () => {
+      const { ctx, handlers } = mkCtx()
+      const f = path.join(tmpDir, 'corrupt-tracker.json')
+      const original = '{invalid'
+      fs.writeFileSync(f, original)
+      const tracker = createUsageTracker(ctx, f, () => {}, [])
+      handlers['session/event']({ id: 's-corrupt' }, mkEvent('p', 'm', { inputTokens: 10 }))
+      assert.strictEqual(fs.readFileSync(f, 'utf8'), original)
+      tracker.stop()
     })
 
     it('per-token 成本能从 delta 正确累计（字段名对齐 schema）', () => {
