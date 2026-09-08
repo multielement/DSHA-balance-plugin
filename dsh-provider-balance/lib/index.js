@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url'
 // ================================================================
 export const PLUGIN_ID = 'dsh-provider-balance'
 export const PLUGIN_NAME = '供应商余额管家'
-export const PLUGIN_VERSION = '1.2.0'
+export const PLUGIN_VERSION = '1.2.1'
 
 // DSH 插件加载契约：必须导出小写 name / inject（loader 读取 entry.options.name）
 // 仅声明必需服务，缺失的会被置 null（collectProviders 已做容错）
@@ -457,6 +457,11 @@ export function createUsageTracker(ctx, stateFilePath, onUpdated, providersRef =
       if (!provider || !model) return
       const usage = event.data?.usage
       if (!usage) return
+      const usageFields = ['inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens']
+      if (usageFields.some(field => usage[field] != null && (typeof usage[field] !== 'number' || !Number.isFinite(usage[field]) || usage[field] < 0))) {
+        console.error(`[${PLUGIN_ID}] ignored invalid usage event`)
+        return
+      }
       const turn = event.data?.turn ?? 0
       const step = event.data?.step ?? 0
       const key = bucketKey(sessionId, turn, step, provider, model)

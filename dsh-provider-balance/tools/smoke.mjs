@@ -415,6 +415,26 @@ describe('dsh-provider-balance — 核心逻辑冒烟测试', () => {
       tracker.stop()
     })
 
+    it('非法 usage 数值不会污染现有账本', () => {
+      const { ctx, handlers } = mkCtx()
+      const f = path.join(tmpDir, 'tracker-invalid-usage.json')
+      const tracker = createUsageTracker(ctx, f, () => {}, [])
+      const session = { id: 's-invalid' }
+      handlers['session/event'](session, mkEvent('p-invalid', 'm', { inputTokens: 10 }))
+      const before = fs.readFileSync(f, 'utf8')
+      const originalError = console.error
+      console.error = () => {}
+      try {
+        handlers['session/event'](session, mkEvent('p-invalid', 'm', { inputTokens: '20' }))
+        handlers['session/event'](session, mkEvent('p-invalid', 'm', { inputTokens: -1 }))
+        handlers['session/event'](session, mkEvent('p-invalid', 'm', { inputTokens: Infinity }))
+      } finally {
+        console.error = originalError
+      }
+      assert.strictEqual(fs.readFileSync(f, 'utf8'), before)
+      tracker.stop()
+    })
+
     it('per-token 成本能从 delta 正确累计（字段名对齐 schema）', () => {
       const { ctx, handlers } = mkCtx()
       const f = path.join(tmpDir, 'tracker-pt.json')
