@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url'
 // ================================================================
 export const PLUGIN_ID = 'dsh-provider-balance'
 export const PLUGIN_NAME = '供应商余额管家'
-export const PLUGIN_VERSION = '1.1.7'
+export const PLUGIN_VERSION = '1.1.8'
 
 // DSH 插件加载契约：必须导出小写 name / inject（loader 读取 entry.options.name）
 // 仅声明必需服务，缺失的会被置 null（collectProviders 已做容错）
@@ -188,11 +188,17 @@ export async function fetchDeepSeekBalance(baseURL, apiKey) {
   const infos = Array.isArray(res.balance_infos) ? res.balance_infos : []
   const pick = pickBalanceInfo(infos)
   if (!pick) throw Object.assign(new Error('balance_infos 为空'), { infos })
+  const total = Number(pick.total_balance)
+  const granted = Number(pick.granted_balance ?? 0)
+  const toppedUp = Number(pick.topped_up_balance ?? 0)
+  if (pick.total_balance == null || !Number.isFinite(total) || !Number.isFinite(granted) || !Number.isFinite(toppedUp)) {
+    throw Object.assign(new Error('balance_infos 包含无效余额'), { balanceInfo: pick })
+  }
   return {
-    total: Number(pick.total_balance ?? 0),
-    remaining: Number(pick.total_balance ?? 0),
-    granted: Number(pick.granted_balance ?? 0),
-    toppedUp: Number(pick.topped_up_balance ?? 0),
+    total,
+    remaining: total,
+    granted,
+    toppedUp,
     currency: (pick.currency || 'CNY').toUpperCase(),
     updatedAt: nowIso()
   }

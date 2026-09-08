@@ -183,6 +183,38 @@ describe('dsh-provider-balance — 核心逻辑冒烟测试', () => {
       }
     })
 
+    it('DeepSeek 无效余额字段会报告格式错误', async () => {
+      const server = http.createServer((_req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ balance_infos: [{ currency: 'CNY', total_balance: 'invalid' }] }))
+      })
+      await new Promise(r => server.listen(0, '127.0.0.1', r))
+      try {
+        const { fetchDeepSeekBalance } = await import('../lib/index.js')
+        await assert.rejects(
+          fetchDeepSeekBalance(`http://127.0.0.1:${server.address().port}`, 'token'),
+          /包含无效余额/
+        )
+      } finally {
+        await new Promise(r => server.close(r))
+      }
+    })
+
+    it('DeepSeek 合法零余额保持可用', async () => {
+      const server = http.createServer((_req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ balance_infos: [{ currency: 'CNY', total_balance: '0', granted_balance: 0, topped_up_balance: 0 }] }))
+      })
+      await new Promise(r => server.listen(0, '127.0.0.1', r))
+      try {
+        const { fetchDeepSeekBalance } = await import('../lib/index.js')
+        const balance = await fetchDeepSeekBalance(`http://127.0.0.1:${server.address().port}`, 'token')
+        assert.deepStrictEqual({ total: balance.total, remaining: balance.remaining }, { total: 0, remaining: 0 })
+      } finally {
+        await new Promise(r => server.close(r))
+      }
+    })
+
     it('中转地址以 /v1 结尾时不会重复拼接路径', async () => {
       const paths = []
       const server = http.createServer((req, res) => {
