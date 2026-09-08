@@ -19,7 +19,7 @@ import {
   pickBalanceInfo, normalizeOneApiPricing, estimateCostFromUsage,
   ONE_API_QUOTA_PER_USD,
   stateFile, writeStateSync, readStateSync, ensureStateSync,
-  collectProviders, cachedAsync, fetchJson, createUsageTracker
+  collectProviders, cachedAsync, invalidateCached, fetchJson, createUsageTracker
 } from '../lib/index.js'
 
 // 面板纯函数（复制 panel.js 核心逻辑，避免动态 ESM 导入）
@@ -252,7 +252,12 @@ describe('dsh-provider-balance — 核心逻辑冒烟测试', () => {
   describe('createUsageTracker 成本累计', () => {
     const mkCtx = () => {
       const handlers = {}
-      return { ctx: { on: (type, fn) => { handlers[type] = fn } }, handlers }
+      let disposed = false
+      return {
+        ctx: { on: (type, fn) => { handlers[type] = fn; return () => { disposed = true } } },
+        handlers,
+        isDisposed: () => disposed
+      }
     }
     const mkEvent = (provider, model, usage) => ({
       type: 'assistant/message',
@@ -277,6 +282,7 @@ describe('dsh-provider-balance — 核心逻辑冒烟测试', () => {
       // 每 500k token = $1，input $1 + output $1 = $2
       assert.strictEqual(s.usage['p-token'].todayCost, 2, 'per-token cost should be accumulated')
       assert.strictEqual(s.books['p-token'].spent, 2, 'books.spent should accumulate too')
+      assert.strictEqual(s.usage['p-token'].models.m.cost, 2, 'model cost should be accumulated')
       tracker.stop()
     })
 
@@ -328,6 +334,43 @@ describe('dsh-provider-balance — 核心逻辑冒烟测试', () => {
       assert.strictEqual(s.books['p-v2'].spent, 0.001)
       tracker.stop()
     })
+
+    it('增量事件只累计一次调用次数，并在 stop 时注销监听器', () => {
+      const { ctx, handlers, isDisposed } = mkCtx()
+      const f = path.join(tmpDir, 'tracker-delta.json')
+      writeStateSync(f, ensureStateSync(f))
+      const providers = [
+        { id: 'p-delta', pricing: { items: [{ model: 'm', billing: 'per-token', inputRatio: 1, completionRatio: 1, groupRatio: 1 }] } }
+      ]
+      const tracker = createUsageTracker(ctx, f, () => {}, providers)
+      const session = { id: 's-delta' }
+      handlers['session/event'](session, mkEvent('p-delta', 'm', { inputTokens: 100, outputTokens: 50 }))
+      handlers['session/event'](session, mkEvent('p-delta', 'm', { inputTokens: 200, outputTokens: 100 }))
+      const usage = ensureStateSync(f).usage['p-delta']
+      assert.strictEqual(usage.todayCalls, 1)
+      assert.strictEqual(usage.models.m.calls, 1)
+      assert.strictEqual(usage.todayTokens, 300)
+      tracker.stop()
+      assert.ok(isDisposed(), 'stop should dispose the session/event listener')
+    })
+
+    it('CNY 自定义余额不直接扣减 USD 估算成本', () => {
+      const { ctx, handlers } = mkCtx()
+      const f = path.join(tmpDir, 'tracker-currency.json')
+      const state = ensureStateSync(f)
+      state.custom['p-cny'] = { balance: 100, currency: 'CNY' }
+      state.books['p-cny'] = { spent: 0, currency: 'CNY' }
+      writeStateSync(f, state)
+      const providers = [
+        { id: 'p-cny', pricing: { items: [{ model: 'm', billing: 'per-call', perCall: 1, groupRatio: 1 }] } }
+      ]
+      const tracker = createUsageTracker(ctx, f, () => {}, providers)
+      handlers['session/event']({ id: 's-cny' }, mkEvent('p-cny', 'm', { inputTokens: 10, outputTokens: 5 }))
+      const saved = ensureStateSync(f)
+      assert.strictEqual(saved.usage['p-cny'].todayCost, 1)
+      assert.strictEqual(saved.books['p-cny'].spent, 0)
+      tracker.stop()
+    })
   })
 
   describe('books 归档逻辑', () => {
@@ -363,6 +406,31 @@ describe('dsh-provider-balance — 核心逻辑冒烟测试', () => {
       assert.ok(Array.isArray(result))
       // 即使空 ctx，deepseek 应被包含（因 deepProps 默认）
       assert.ok(result.some(p => p.id === 'deepseek'), 'should include deepseek by default')
+    })
+
+    it('未知 live provider 不继承 DeepSeek 地址或凭据', async () => {
+      const ctx = {
+        llm: { listProviders: () => [{ id: 'openai', name: 'OpenAI' }] },
+        settings: { describe: async () => [] },
+        credentials: { resolve: async () => null }
+      }
+      const result = await collectProviders(ctx)
+      const provider = result.find(p => p.id === 'openai')
+      assert.strictEqual(provider.baseURL, '')
+      assert.strictEqual(provider.isOfficial, false)
+      assert.strictEqual(provider.apiKeyEnv, undefined)
+    })
+
+    it('pi-ai 中名为 deepseek 的中转地址保持 relay 分类', async () => {
+      const ctx = {
+        llm: { listProviders: () => [{ id: 'deepseek', name: 'Relay' }] },
+        settings: { describe: async () => [{ ns: 'llm-pi-ai', value: { providers: { deepseek: { baseURL: 'https://relay.example/v1', apiKeyEnv: 'RELAY_KEY' } } } }] },
+        credentials: { resolve: async () => ({ value: 'secret', source: 'test' }) }
+      }
+      const provider = (await collectProviders(ctx)).find(p => p.id === 'deepseek')
+      assert.strictEqual(provider.baseURL, 'https://relay.example/v1')
+      assert.strictEqual(provider.isOfficial, false)
+      assert.strictEqual(provider.apiKeyEnv, 'RELAY_KEY')
     })
   })
 
@@ -431,6 +499,26 @@ describe('cachedAsync 缓存与失效', () => {
     await assert.rejects(cachedAsync(fn, 'k3', 60000))
     const v = await cachedAsync(fn, 'k3', 60000)
     assert.equal(v, 'ok', 'should retry on next call')
+  })
+
+  it('按前缀失效缓存', async () => {
+    let calls = 0
+    const fn = () => Promise.resolve(++calls)
+    assert.equal(await cachedAsync(fn, 'bal_provider-a', 60000), 1)
+    assert.equal(await cachedAsync(fn, 'bal_provider-a', 60000), 1)
+    invalidateCached('bal_provider-a')
+    assert.equal(await cachedAsync(fn, 'bal_provider-a', 60000), 2)
+  })
+
+  it('失效进行中的请求后不会被旧结果重新填充', async () => {
+    let resolveFirst
+    const first = cachedAsync(() => new Promise(resolve => { resolveFirst = resolve }), 'price_race', 60000)
+    invalidateCached('price_race')
+    const second = cachedAsync(() => Promise.resolve('new'), 'price_race', 60000)
+    resolveFirst('old')
+    assert.equal(await first, 'old')
+    assert.equal(await second, 'new')
+    assert.equal(await cachedAsync(() => Promise.resolve('unexpected'), 'price_race', 60000), 'new')
   })
 })
 

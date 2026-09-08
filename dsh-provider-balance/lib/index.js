@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url'
 // ================================================================
 export const PLUGIN_ID = 'dsh-provider-balance'
 export const PLUGIN_NAME = '供应商余额管家'
-export const PLUGIN_VERSION = '1.1.0'
+export const PLUGIN_VERSION = '1.1.1'
 
 // DSH 插件加载契约：必须导出小写 name / inject（loader 读取 entry.options.name）
 // 仅声明必需服务，缺失的会被置 null（collectProviders 已做容错）
@@ -104,17 +104,27 @@ export function ensureStateSync(file) {
 // ================================================================
 // 异步缓存（单 key 单 promise，带 TTL；失败自动出队允许重试）
 // ================================================================
-// 异步缓存（单 key 单 promise，带 TTL；失败自动出队允许重试）
-// ================================================================
 const _cache = new Map()
 export function cachedAsync(fn, key, ttlMs) {
   const entry = _cache.get(key)
   if (entry && Date.now() - entry.ts < ttlMs) return entry.val
   const p = fn()
-    .then(v => { _cache.set(key, { val: v, ts: Date.now() }); return v })
-    .catch(e => { _cache.delete(key); throw e })
+    .then(v => {
+      if (_cache.get(key)?.val === p) _cache.set(key, { val: v, ts: Date.now() })
+      return v
+    })
+    .catch(e => {
+      if (_cache.get(key)?.val === p) _cache.delete(key)
+      throw e
+    })
   _cache.set(key, { val: p, ts: Date.now() })
   return p
+}
+
+export function invalidateCached(prefix) {
+  for (const key of _cache.keys()) {
+    if (key.startsWith(prefix)) _cache.delete(key)
+  }
 }
 
 // ================================================================
@@ -251,7 +261,10 @@ async function resolveApiKey(ctx, envName) {
 export async function collectProviders(ctx) {
   const providers = []
   let routeList = []
-  try { routeList = Array.isArray(ctx.llm?.listProviders) ? ctx.llm.listProviders() : [] } catch {}
+  try {
+    routeList = typeof ctx.llm?.listProviders === 'function' ? ctx.llm.listProviders() : []
+    if (!Array.isArray(routeList)) routeList = []
+  } catch {}
   const knownIds = new Set(routeList.map(p => p.id))
 
   let piProps = {}
@@ -269,8 +282,8 @@ export async function collectProviders(ctx) {
   for (const routeId of allRouteIds) {
     const routeInfo = routeList.find(p => p.id === routeId)
     const profile = piRoutes[routeId] ?? null
-    const baseURL = (profile?.baseURL || deepProps.baseURL || '').replace(/\/$/, '')
-    const isOfficial = routeId === 'deepseek' || isDeepSeekOfficial(baseURL)
+    const baseURL = (profile?.baseURL || (routeId === 'deepseek' ? deepProps.baseURL : '') || '').replace(/\/$/, '')
+    const isOfficial = isDeepSeekOfficial(baseURL) || (routeId === 'deepseek' && !profile)
     const displayName = profile?.displayName || routeInfo?.name || routeId
     const apiKeyEnv = profile?.apiKeyEnv || (isOfficial ? deepProps.apiKeyEnv : undefined)
     const cred = await resolveApiKey(ctx, apiKeyEnv)
@@ -304,7 +317,7 @@ export function createUsageTracker(ctx, stateFilePath, onUpdated, providersRef =
   const prev = new Map()  // bucketKey → {provider, model, usage}
   function bucketKey(sid, turn, step) { return `${sid}|${turn}|${step}` }
 
-  function applyDelta(providerId, model, delta) {
+  function applyDelta(providerId, model, delta, countCall) {
     const tk = todayKey()
     const state = ensureStateSync(stateFilePath)
     if (!state.usage[providerId]) {
@@ -326,10 +339,11 @@ export function createUsageTracker(ctx, stateFilePath, onUpdated, providersRef =
       }
     }
     const totalTokens = (delta.input || 0) + (delta.output || 0) + (delta.cacheRead || 0) + (delta.cacheWrite || 0) + (delta.reasoning || 0)
-    bucket.todayCalls += 1
+    if (countCall) bucket.todayCalls += 1
     bucket.todayTokens += totalTokens
 
     // 估算成本并更新 usage.todayCost 和 books.spent
+    let estimatedCost = 0
     try {
       const currentProviders = providersRef || []
       const provider = currentProviders.find(p => p.id === providerId)
@@ -343,13 +357,19 @@ export function createUsageTracker(ctx, stateFilePath, onUpdated, providersRef =
           reasoningTokens: delta.reasoning
         }, model, 'session/event')
         if (cost != null && cost > 0) {
+          estimatedCost = cost
           // 保留 6 位小数，避免 per-call 微额计价被 roundMoney(2) 抹零
           bucket.todayCost = roundMoney(bucket.todayCost + cost, 6)
-          if (!state.books[providerId]) {
-            state.books[providerId] = { spent: 0, currency: 'USD', updatedAt: nowIso() }
+          const customCurrency = state.custom[providerId]?.currency
+          const booksCurrency = state.books[providerId]?.currency || customCurrency || 'USD'
+          // 内置/中转定价均为 USD；跨币种缺少汇率时不修改自定义余额账本。
+          if (booksCurrency === 'USD') {
+            if (!state.books[providerId]) {
+              state.books[providerId] = { spent: 0, currency: 'USD', updatedAt: nowIso() }
+            }
+            state.books[providerId].spent = roundMoney((state.books[providerId].spent || 0) + cost, 6)
+            state.books[providerId].updatedAt = nowIso()
           }
-          state.books[providerId].spent = roundMoney((state.books[providerId].spent || 0) + cost, 6)
-          state.books[providerId].updatedAt = nowIso()
         }
       }
     } catch (e) {
@@ -357,14 +377,15 @@ export function createUsageTracker(ctx, stateFilePath, onUpdated, providersRef =
     }
 
     if (!bucket.models[model]) bucket.models[model] = { calls: 0, tokens: 0, cost: 0 }
-    bucket.models[model].calls += 1
+    if (countCall) bucket.models[model].calls += 1
     bucket.models[model].tokens += totalTokens
+    bucket.models[model].cost = roundMoney((bucket.models[model].cost || 0) + estimatedCost, 6)
     state.seenProviders = [...new Set([...(state.seenProviders || []), providerId])]
     writeStateSync(stateFilePath, state)
     onUpdated()
   }
 
-  ctx.on('session/event', (session, event) => {
+  const dispose = ctx.on('session/event', (session, event) => {
     try {
       if (!event || event.type !== 'assistant/message') return
       const sessionId = session?.id ?? session?.sessionId ?? String(session?.seq ?? 0)
@@ -402,13 +423,20 @@ export function createUsageTracker(ctx, stateFilePath, onUpdated, providersRef =
       }
       if (Object.values(delta).every(v => v <= 0)) return
       prev.set(key, { provider, model, usage: cur, at: Date.now() })
-      applyDelta(provider, model, delta)
+      if (prev.size > 10_000) prev.delete(prev.keys().next().value)
+      applyDelta(provider, model, delta, !prevEntry)
     } catch (e) {
       console.error('[provider-balance] usage tracking error:', e)
     }
   })
 
-  return { seen: prev, stop: () => { prev.clear() } }
+  return {
+    seen: prev,
+    stop: () => {
+      if (typeof dispose === 'function') dispose()
+      prev.clear()
+    }
+  }
 }
 
 // ================================================================
@@ -417,8 +445,6 @@ export function createUsageTracker(ctx, stateFilePath, onUpdated, providersRef =
 export function apply(ctx) {
   const stateFilePath = stateFile()
   let providers = []
-  const balanceCache = new Map()
-  const pricingCache = new Map()
   let lastSummary = null
   let stopUsageTracker = () => {}
   const disposers = []
@@ -439,14 +465,15 @@ export function apply(ctx) {
     const custom = state.custom[provider.id]
     if (custom && custom.balance != null) {
       const books = state.books[provider.id] || { spent: 0, currency: custom.currency || DEFAULT_CUSTOM_CURRENCY_RELAY }
-      const rem = roundMoney(Number(custom.balance) - Number(books.spent || 0))
+      const spent = books.currency === custom.currency ? Number(books.spent || 0) : 0
+      const rem = roundMoney(Number(custom.balance) - spent, 6)
       return { mode: 'custom', available: true, remaining: rem, total: Number(custom.balance), currency: custom.currency || books.currency, updatedAt: custom.updatedAt, source: 'custom', error: null }
     }
     if (provider.credential !== 'ok') {
       return { mode: 'auto', available: false, error: '未配置 API Key', source: provider.isOfficial ? 'deepseek' : 'relay' }
     }
     const cacheKey = `bal_${provider.id}`
-    if (bust) balanceCache.delete(cacheKey)
+    if (bust) invalidateCached(cacheKey)
     return cachedAsync(async () => {
       const cred = await resolveProviderKey(provider)
       if (!cred?.value) throw Object.assign(new Error('凭据解析失败'), { provider: provider.id })
@@ -459,7 +486,7 @@ export function apply(ctx) {
   async function probePricing(provider, bust = false) {
     if (provider.credential !== 'ok') return null
     const cacheKey = `price_${provider.id}`
-    if (bust) pricingCache.delete(cacheKey)
+    if (bust) invalidateCached(cacheKey)
     return cachedAsync(async () => {
       const overrides = ensureStateSync(stateFilePath).overrides || {}
       // DeepSeek 官方：使用内置价格参考表（可被用户 overrides 覆盖）
@@ -488,6 +515,7 @@ export function apply(ctx) {
         probeBalance(p, bustAll).catch(e => ({ mode: 'auto', available: false, error: e.message, source: p.isOfficial ? 'deepseek' : 'relay' })),
         probePricing(p, bustAll).catch(() => null)
       ])
+      p.pricing = price
       const usage = state.usage[p.id] || { todayKey: '', todayCalls: 0, todayTokens: 0, todayCost: 0, total: {}, models: {} }
       const books = state.books[p.id] || { spent: 0, currency: 'USD', updatedAt: '' }
       return {
@@ -543,8 +571,13 @@ export function apply(ctx) {
     try {
       const body = await parseBody(req)
       const { provider } = body
-      if (provider) { balanceCache.delete(`bal_${provider}`); pricingCache.delete(`price_${provider}`) }
-      else { balanceCache.clear(); pricingCache.clear() }
+      if (provider) {
+        invalidateCached(`bal_${provider}`)
+        invalidateCached(`price_${provider}`)
+      } else {
+        invalidateCached('bal_')
+        invalidateCached('price_')
+      }
       lastSummary = await buildSummary()
       for (const cb of subscribers) { try { cb(lastSummary) } catch {} }
       await sendJson(res, lastSummary)
@@ -566,8 +599,11 @@ export function apply(ctx) {
         const balanceNum = Number(balance)
         if (!Number.isFinite(balanceNum) || balanceNum < 0) throw new Error('balance 必须是非负数字')
         const cur = String(currency || '').toUpperCase() || (state.books[provider]?.currency || DEFAULT_CUSTOM_CURRENCY_RELAY)
+        const previous = state.custom[provider]
         state.custom[provider] = { balance: balanceNum, currency: cur, updatedAt: nowIso() }
-        if (resetBooks) state.books[provider] = { spent: 0, currency: cur, updatedAt: nowIso() }
+        if (resetBooks || !previous || state.books[provider]?.currency !== cur) {
+          state.books[provider] = { spent: 0, currency: cur, updatedAt: nowIso() }
+        }
         writeStateSync(stateFilePath, state)
         lastSummary = null
         await sendJson(res, { ok: true, updated: provider })
@@ -594,7 +630,7 @@ export function apply(ctx) {
         state.overrides = overrides
         writeStateSync(stateFilePath, state)
         // overrides 变更后旧 pricing 缓存仍然有效 10 分钟，主动失效让修改立即生效
-        pricingCache.clear()
+        invalidateCached('price_')
         lastSummary = null
         await sendJson(res, { ok: true })
       } catch (e) { await sendJson(res, { ok: false, error: e.message }) }
@@ -605,14 +641,14 @@ export function apply(ctx) {
   // HTTP 路由（数据驱动注册表）
   // ============================================================
   const routeTable = [
-    { kind: 'prefix', path: `${ROUTE_BASE}/summary.json`,  fn: handleSummary },
-    { kind: 'prefix', path: `${ROUTE_BASE}/refresh.json`,  fn: handleRefresh },
-    { kind: 'prefix', path: `${ROUTE_BASE}/custom.json`,   fn: handleCustom },
-    { kind: 'prefix', path: `${ROUTE_BASE}/usage.json`,    fn: (req, res) => { const s = ensureStateSync(stateFilePath); sendJson(res, s.usage || {}) } },
-    { kind: 'prefix', path: `${ROUTE_BASE}/overrides.json`,fn: handleOverrides },
-    { kind: 'prefix', path: `${ROUTE_BASE}/health.json`,   fn: (req, res) => sendJson(res, { ok: true, plugin: PLUGIN_ID, version: PLUGIN_VERSION, providers: providers.length }) },
-    { kind: 'prefix', path: `${ROUTE_BASE}/panel.js`,      fn: (req, res) => sendText(res, panelJsContent, panelJsContent ? 200 : 404) },
-    { kind: 'prefix', path: `${ROUTE_BASE}/panel.css`,     fn: (req, res) => sendText(res, panelCssContent, panelCssContent ? 200 : 404) },
+    { kind: 'exact', path: `${ROUTE_BASE}/summary.json`,  fn: handleSummary },
+    { kind: 'exact', path: `${ROUTE_BASE}/refresh.json`,  fn: handleRefresh },
+    { kind: 'exact', path: `${ROUTE_BASE}/custom.json`,   fn: handleCustom },
+    { kind: 'exact', path: `${ROUTE_BASE}/usage.json`,    fn: handleUsage },
+    { kind: 'exact', path: `${ROUTE_BASE}/overrides.json`,fn: handleOverrides },
+    { kind: 'exact', path: `${ROUTE_BASE}/health.json`,   fn: (req, res) => sendJson(res, { ok: true, plugin: PLUGIN_ID, version: PLUGIN_VERSION, providers: providers.length }) },
+    { kind: 'exact', path: `${ROUTE_BASE}/panel.js`,      fn: (req, res) => sendText(res, panelJsContent, panelJsContent ? 200 : 404, 'application/javascript; charset=utf-8') },
+    { kind: 'exact', path: `${ROUTE_BASE}/panel.css`,     fn: (req, res) => sendText(res, panelCssContent, panelCssContent ? 200 : 404, 'text/css; charset=utf-8') },
   ]
 
   for (const { kind, path, fn } of routeTable) {
@@ -626,7 +662,7 @@ export function apply(ctx) {
 
   // 注入 panel.js + panel.css 到 index.html
   try {
-    const tapDisposer = ctx.webServer.tapIndex(async (html) => {
+    const tapDisposer = ctx.webServer.tapIndex((html) => {
       if (!html || html.indexOf(ROUTE_BASE) !== -1) return html
       const css = `<link rel="stylesheet" href="${ROUTE_BASE}/panel.css">`
       const js = `<script type="module" src="${ROUTE_BASE}/panel.js"></script>`

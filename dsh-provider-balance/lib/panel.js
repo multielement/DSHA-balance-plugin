@@ -147,7 +147,10 @@ function mount() {
 
   pill.addEventListener('click', () => {
     panel.classList.toggle('hidden')
-    if (!panel.classList.contains('hidden')) poll()
+    if (!panel.classList.contains('hidden')) {
+      poll()
+      if (!pollTimer) pollTimer = setInterval(poll, 60_000)
+    }
   })
 }
 
