@@ -2,7 +2,7 @@
 
 > DSHA / DeepSeek Harness 上的供应商余额管家插件。自动查询各供应商余额、识别按次/按量计费倍率、支持自定义余额本地记账。
 
-- **DSHA 版本**：1.1.9.x（内置 dsh `0.1.1-rc.2`）
+- **DSHA 版本**：1.1.9.x ~ 1.2.x（dsh `0.1.1-rc.2` ~ `0.1.3-alpha.2`，已逐包比对 API）
 - **Node 要求**：>= 22.19.0
 - **依赖**：零依赖（纯 ESM）
 - **许可证**：MIT
@@ -44,7 +44,7 @@
 ### 方式一：npm 安装（推荐）
 
 ```bash
-dsha-plugin install dsh-provider-balance@1.0.1
+dsha-plugin install dsh-provider-balance@1.1.0
 ```
 
 或本地路径：
@@ -145,6 +145,7 @@ node --test tools/smoke.mjs
 
 - **DSH 0.1.1-rc.2**（DSHA 1.1.9.x）：已验证 API 形态
 - **DSH 0.1.2-rc.1**（DSHA 1.2.x）：`ctx.settings.describe()` 签名兼容
+- **DSH 0.1.3-alpha.2**（DSHA 1.2.x 最新）：逐包比对通过——`webServer.register/tapIndex`、`settings`、`credentials`、`llm.listProviders`、`TokenUsage` 不变；`assistant/message` 事件新增 `stream` 字段与 `assistant/attempt` 类型，插件不依赖。provider/model 提取兼容 `header.config` 与 `message.source`（AssistantProvenance）双通道
 - **Node >= 22**：require
 
 ## 致谢

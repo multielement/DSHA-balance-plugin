@@ -106,6 +106,8 @@ function renderPanel(data) {
 // 悬浮按钮 & 面板
 // ================================================================
 function mount() {
+  // 幂等：pageshow（bfcache 恢复）可能再次触发 start，避免重复挂载
+  if (document.getElementById('dsh-pb-root')) return
   const root = document.createElement('div')
   root.id = 'dsh-pb-root'
   root.innerHTML = `
@@ -160,11 +162,17 @@ async function poll() {
     if (dot) dot.className = 'dot' + (data.ok ? '' : ' err')
     const label = document.querySelector('#dsh-pb-pill-label')
     if (label && data.providers?.length) {
+      // 余额单位混杂（CNY/USD），不做跨币种平均——只显示可用数量与分组总计
       const available = data.providers.filter(p => p.balance?.available !== false)
-      const avg = available.length > 0
-        ? Math.round((available.reduce((s, p) => s + (p.balance?.remaining ?? 0), 0) / available.length) * 100) / 100
-        : 0
-      label.textContent = `余额 ${fmt(avg, 2)}`
+      const byCurrency = new Map()
+      for (const p of available) {
+        const cur = p.balance?.currency || 'USD'
+        byCurrency.set(cur, (byCurrency.get(cur) || 0) + (p.balance?.remaining ?? 0))
+      }
+      const parts = [...byCurrency.entries()].map(([c, v]) => `${fmt(v, 2)} ${c}`)
+      label.textContent = available.length > 0
+        ? (parts.length > 1 ? parts.join(' / ') : `余额 ${parts[0] || ''}`)
+        : '不可用'
     }
   } catch (e) {
     console.error('[dsh-pb] poll error:', e)
@@ -249,16 +257,20 @@ function showSetBalance(providerId, mode, data) {
     if (e.target.id === 'dlg-ok') {
       const bal = parseFloat(dlg.querySelector('#dlg-bal').value)
       const cur = dlg.querySelector('#dlg-cur').value
-      if (isNaN(bal)) { alert('请输入有效数字'); return }
-      const res = await fetch(`${API_BASE}/custom.json`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ provider: providerId, balance: bal, currency: cur, resetBooks: mode === 'custom' })
-      })
-      const json = await res.json()
-      if (!json.ok) { alert('保存失败: ' + (json.error || '')); return }
-      cleanup()
-      await poll()
+      if (isNaN(bal) || bal < 0) { alert('请输入非负数字'); return }
+      try {
+        const res = await fetch(`${API_BASE}/custom.json`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ provider: providerId, balance: bal, currency: cur, resetBooks: mode === 'custom' })
+        })
+        const json = await res.json()
+        if (!json.ok) { alert('保存失败: ' + (json.error || '')); return }
+        cleanup()
+        await poll()
+      } catch (err) {
+        alert('网络错误: ' + (err.message || '请求失败'))
+      }
     } else if (e.target.id === 'dlg-cancel' || e.target.classList.contains('dlg-mask')) {
       cleanup()
     }
@@ -270,7 +282,10 @@ function showSetBalance(providerId, mode, data) {
 // ================================================================
 // 启动
 // ================================================================
+let started = false
 function start() {
+  if (started) { if (!pollTimer) pollTimer = setInterval(poll, 60_000); return }
+  started = true
   mount()
   poll()
   pollTimer = setInterval(poll, 60_000)

@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url'
 // ================================================================
 export const PLUGIN_ID = 'dsh-provider-balance'
 export const PLUGIN_NAME = '供应商余额管家'
-export const PLUGIN_VERSION = '1.0.0'
+export const PLUGIN_VERSION = '1.1.0'
 
 // DSH 插件加载契约：必须导出小写 name / inject（loader 读取 entry.options.name）
 // 仅声明必需服务，缺失的会被置 null（collectProviders 已做容错）
@@ -27,6 +27,21 @@ export const BALANCE_TTL_MS = 60_000
 export const PRICING_TTL_MS = 600_000
 export const STATE_KEY = 'dsh-provider-balance.json'
 export const DEFAULT_CUSTOM_CURRENCY_RELAY = 'USD'
+
+// DeepSeek 官方内置价格参考（单位换算：one-api quota，$1 = 500000 quota）
+// 价格来源：DeepSeek 官方定价页（deepseek-chat: $0.27/M in, $1.10/M out;
+// deepseek-reasoner: $0.55/M in, $2.19/M out）。可能过时，可通过 /overrides.json 覆盖。
+export const DEEPSEEK_BUILTIN_PRICING = {
+  groupRatio: 1,
+  currency: 'USD',
+  items: [
+    { model: 'deepseek-chat',     billing: 'per-token', perCall: 0, inputRatio: 0.135,  completionRatio: 4.0740741, groupRatio: 1 },
+    { model: 'deepseek-reasoner', billing: 'per-token', perCall: 0, inputRatio: 0.275,  completionRatio: 3.9818182, groupRatio: 1 }
+  ]
+}
+
+/** 用量历史保留天数（超过的日归档 bucket 会被裁剪，防止状态文件膨胀） */
+export const HISTORY_RETENTION_DAYS = 30
 
 // 解析 lib 目录绝对路径
 const _libDir = path.dirname(fileURLToPath(import.meta.url))
@@ -67,6 +82,8 @@ export function stateFile() {
 }
 
 export function writeStateSync(file, obj) {
+  // 首次运行时 $DSH_HOME 目录可能不存在，写入前先确保父目录已创建
+  try { fs.mkdirSync(path.dirname(file), { recursive: true }) } catch {}
   try {
     const tmp = file + '.tmp'
     fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), 'utf8')
@@ -105,10 +122,11 @@ export function cachedAsync(fn, key, ttlMs) {
 // ================================================================
 export async function fetchJson(urlStr, opts = {}) {
   const { timeout = 10_000, headers = {}, method = 'GET', retries = 0, retryDelay = 500 } = opts
-  const ctrl = new AbortController()
-  const timer = setTimeout(() => ctrl.abort(), timeout)
   let lastError
+  // 每次重试使用独立 AbortController，避免超时后复用已中止的信号导致重试必然失败
   for (let i = 0; i <= retries; i++) {
+    const ctrl = new AbortController()
+    const timer = setTimeout(() => ctrl.abort(), timeout)
     try {
       const res = await fetch(urlStr, { ...opts, headers, method, signal: ctrl.signal })
       const text = await res.text()
@@ -117,6 +135,8 @@ export async function fetchJson(urlStr, opts = {}) {
     } catch (e) {
       lastError = e
       if (i < retries) await new Promise(r => setTimeout(r, retryDelay))
+    } finally {
+      clearTimeout(timer)
     }
   }
   throw lastError
@@ -299,6 +319,11 @@ export function createUsageTracker(ctx, stateFilePath, onUpdated, providersRef =
       bucket.todayTokens = 0
       bucket.todayCost = 0
       bucket.models = {}
+      // 裁剪超过保留期的日归档，防止状态文件无限膨胀
+      const cutoff = new Date(Date.now() - HISTORY_RETENTION_DAYS * 86400_000).toISOString().slice(0, 10)
+      for (const k of Object.keys(bucket)) {
+        if (k.endsWith('_done') && k.slice(0, 10) < cutoff) delete bucket[k]
+      }
     }
     const totalTokens = (delta.input || 0) + (delta.output || 0) + (delta.cacheRead || 0) + (delta.cacheWrite || 0) + (delta.reasoning || 0)
     bucket.todayCalls += 1
@@ -309,13 +334,21 @@ export function createUsageTracker(ctx, stateFilePath, onUpdated, providersRef =
       const currentProviders = providersRef || []
       const provider = currentProviders.find(p => p.id === providerId)
       if (provider?.pricing) {
-        const { cost } = estimateCostFromUsage(provider.pricing, delta, model, 'session/event')
+        // delta 字段与 estimateCostFromUsage 的 TokenUsage schema 对齐
+        const { cost } = estimateCostFromUsage(provider.pricing, {
+          inputTokens: delta.input,
+          outputTokens: delta.output,
+          cacheReadTokens: delta.cacheRead,
+          cacheWriteTokens: delta.cacheWrite,
+          reasoningTokens: delta.reasoning
+        }, model, 'session/event')
         if (cost != null && cost > 0) {
-          bucket.todayCost = roundMoney(bucket.todayCost + cost)
+          // 保留 6 位小数，避免 per-call 微额计价被 roundMoney(2) 抹零
+          bucket.todayCost = roundMoney(bucket.todayCost + cost, 6)
           if (!state.books[providerId]) {
             state.books[providerId] = { spent: 0, currency: 'USD', updatedAt: nowIso() }
           }
-          state.books[providerId].spent = roundMoney((state.books[providerId].spent || 0) + cost)
+          state.books[providerId].spent = roundMoney((state.books[providerId].spent || 0) + cost, 6)
           state.books[providerId].updatedAt = nowIso()
         }
       }
@@ -335,9 +368,12 @@ export function createUsageTracker(ctx, stateFilePath, onUpdated, providersRef =
     try {
       if (!event || event.type !== 'assistant/message') return
       const sessionId = session?.id ?? session?.sessionId ?? String(session?.seq ?? 0)
+      // 路由信息双通道：request/header 世界用 header.config.provider；DSHA 1.2+
+      // 同时可直接从 message.source（AssistantProvenance）读取 provider/model。
       const d = event.data?.header?.config
-      const provider = d?.provider
-      const model = d?.model ?? event.data?.message?.source?.model
+      const src = event.data?.message?.source
+      const provider = d?.provider ?? src?.provider
+      const model = d?.model ?? src?.model
       if (!provider || !model) return
       const usage = event.data?.usage
       if (!usage) return
@@ -372,7 +408,7 @@ export function createUsageTracker(ctx, stateFilePath, onUpdated, providersRef =
     }
   })
 
-  return { seen: prev }
+  return { seen: prev, stop: () => { prev.clear() } }
 }
 
 // ================================================================
@@ -384,6 +420,7 @@ export function apply(ctx) {
   const balanceCache = new Map()
   const pricingCache = new Map()
   let lastSummary = null
+  let stopUsageTracker = () => {}
   const disposers = []
   const subscribers = new Set()
 
@@ -411,24 +448,35 @@ export function apply(ctx) {
     const cacheKey = `bal_${provider.id}`
     if (bust) balanceCache.delete(cacheKey)
     return cachedAsync(async () => {
-      const key = await resolveProviderKey(provider)
-      if (!key) throw Object.assign(new Error('凭据解析失败'), { provider: provider.id })
-      if (provider.isOfficial) return fetchDeepSeekBalance(provider.baseURL, key)
-      return fetchRelayBalance(provider.baseURL, key)
+      const cred = await resolveProviderKey(provider)
+      if (!cred?.value) throw Object.assign(new Error('凭据解析失败'), { provider: provider.id })
+      // resolveProviderKey 返回 {value, source}，只取 value 组装 Authorization
+      if (provider.isOfficial) return fetchDeepSeekBalance(provider.baseURL, cred.value)
+      return fetchRelayBalance(provider.baseURL, cred.value)
     }, cacheKey, BALANCE_TTL_MS)
   }
 
   async function probePricing(provider, bust = false) {
-    if (provider.isOfficial || provider.credential !== 'ok') return null
+    if (provider.credential !== 'ok') return null
     const cacheKey = `price_${provider.id}`
     if (bust) pricingCache.delete(cacheKey)
     return cachedAsync(async () => {
-      const key = await resolveProviderKey(provider)
-      const base = provider.baseURL
-      if (!base) return null
-      try { return normalizeOneApiPricing(await fetchJson(`${base}/api/pricing`, { timeout: 6000 })) } catch {}
-      try { return normalizeOneApiPricing(await fetchJson(`${base}/api/pricing`, { headers: { Authorization: `Bearer ${key}` }, timeout: 6000 })) } catch {}
-      return null
+      const overrides = ensureStateSync(stateFilePath).overrides || {}
+      // DeepSeek 官方：使用内置价格参考表（可被用户 overrides 覆盖）
+      let base = null
+        if (provider.isOfficial) {
+          base = DEEPSEEK_BUILTIN_PRICING
+        } else if (provider.baseURL) {
+          const cred = await resolveProviderKey(provider)
+          try { base = normalizeOneApiPricing(await fetchJson(`${provider.baseURL}/api/pricing`, { timeout: 6000 })) } catch {}
+          if (!base) {
+            try { base = normalizeOneApiPricing(await fetchJson(`${provider.baseURL}/api/pricing`, { headers: { Authorization: `Bearer ${cred?.value ?? ''}` }, timeout: 6000 })) } catch {}
+          }
+          if (!base) return null
+        }
+      // 将用户 overrides（按模型名索引）合入 pricing，estimateCostFromUsage 优先取 overrides
+      const provOverrides = overrides[provider.id] || {}
+      return base ? { ...base, overrides: provOverrides } : null
     }, cacheKey, PRICING_TTL_MS)
   }
 
@@ -458,9 +506,11 @@ export function apply(ctx) {
   }
   init().catch(e => console.error('[provider-balance] init failed:', e))
 
-  // 路由注册
+  // 路由注册（注册失败由下方 try/catch 兜底，这里保留统一入口便于后续加观测）
   function registerRoute(kind, route, handler) {
-    ctx.webServer.register({ kind, path: route, handler })
+    const disposer = ctx.webServer.register({ kind, path: route, handler })
+    if (typeof disposer === 'function') disposers.push(disposer)
+    return disposer
   }
 
   // 请求体解析工具
@@ -513,8 +563,10 @@ export function apply(ctx) {
         const { provider, balance, currency, resetBooks = false } = body
         if (!provider) throw new Error('provider 必填')
         if (balance == null) throw new Error('balance 必填')
+        const balanceNum = Number(balance)
+        if (!Number.isFinite(balanceNum) || balanceNum < 0) throw new Error('balance 必须是非负数字')
         const cur = String(currency || '').toUpperCase() || (state.books[provider]?.currency || DEFAULT_CUSTOM_CURRENCY_RELAY)
-        state.custom[provider] = { balance: Number(balance), currency: cur, updatedAt: nowIso() }
+        state.custom[provider] = { balance: balanceNum, currency: cur, updatedAt: nowIso() }
         if (resetBooks) state.books[provider] = { spent: 0, currency: cur, updatedAt: nowIso() }
         writeStateSync(stateFilePath, state)
         lastSummary = null
@@ -541,6 +593,8 @@ export function apply(ctx) {
         if (typeof overrides !== 'object' || overrides === null || Array.isArray(overrides)) throw new Error('overrides 应为对象')
         state.overrides = overrides
         writeStateSync(stateFilePath, state)
+        // overrides 变更后旧 pricing 缓存仍然有效 10 分钟，主动失效让修改立即生效
+        pricingCache.clear()
         lastSummary = null
         await sendJson(res, { ok: true })
       } catch (e) { await sendJson(res, { ok: false, error: e.message }) }
@@ -551,7 +605,7 @@ export function apply(ctx) {
   // HTTP 路由（数据驱动注册表）
   // ============================================================
   const routeTable = [
-    { kind: 'prefix', path: `${ROUTE_BASE}/summary.json`,  fn: (req, res) => sendJson(res, buildSummary()) },
+    { kind: 'prefix', path: `${ROUTE_BASE}/summary.json`,  fn: handleSummary },
     { kind: 'prefix', path: `${ROUTE_BASE}/refresh.json`,  fn: handleRefresh },
     { kind: 'prefix', path: `${ROUTE_BASE}/custom.json`,   fn: handleCustom },
     { kind: 'prefix', path: `${ROUTE_BASE}/usage.json`,    fn: (req, res) => { const s = ensureStateSync(stateFilePath); sendJson(res, s.usage || {}) } },
@@ -563,8 +617,7 @@ export function apply(ctx) {
 
   for (const { kind, path, fn } of routeTable) {
     try {
-      const disposer = ctx.webServer.register({ kind, path, handler: fn })
-      if (typeof disposer === 'function') disposers.push(disposer)
+      registerRoute(kind, path, fn)
     } catch (e) {
       // duplicate route 等异常不应阻断 DSH web ui 启动
       console.error(`[${PLUGIN_ID}] route register failed (${path}):`, e.message)

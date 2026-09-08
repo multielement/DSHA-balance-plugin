@@ -3,6 +3,7 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
+import http from 'node:http'
 import path from 'node:path'
 import os from 'node:os'
 import { fileURLToPath } from 'node:url'
@@ -18,7 +19,7 @@ import {
   pickBalanceInfo, normalizeOneApiPricing, estimateCostFromUsage,
   ONE_API_QUOTA_PER_USD,
   stateFile, writeStateSync, readStateSync, ensureStateSync,
-  collectProviders, cachedAsync
+  collectProviders, cachedAsync, fetchJson, createUsageTracker
 } from '../lib/index.js'
 
 // 面板纯函数（复制 panel.js 核心逻辑，避免动态 ESM 导入）
@@ -161,6 +162,27 @@ describe('dsh-provider-balance — 核心逻辑冒烟测试', () => {
     })
   })
 
+  describe('余额探测 HTTP 请求', () => {
+    it('DeepSeek 请求携带真实 Bearer 凭据（回归: 曾传 {value} 对象导致 [object Object]）', async () => {
+      let authHeader = null
+      const server = http.createServer((req, res) => {
+        authHeader = req.headers.authorization
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ balance_infos: [{ currency: 'CNY', total_balance: 10, granted_balance: 2, topped_up_balance: 8 }] }))
+      })
+      await new Promise(r => server.listen(0, '127.0.0.1', r))
+      try {
+        const { fetchDeepSeekBalance } = await import('../lib/index.js')
+        const bal = await fetchDeepSeekBalance(`http://127.0.0.1:${server.address().port}`, 'sk-real-token')
+        assert.strictEqual(authHeader, 'Bearer sk-real-token', 'Authorization 必须是实际字符串 token')
+        assert.strictEqual(bal.total, 10)
+        assert.strictEqual(bal.currency, 'CNY')
+      } finally {
+        await new Promise(r => server.close(r))
+      }
+    })
+  })
+
   describe('estimateCostFromUsage', () => {
     it('per-call 模式返回 perCall * groupRatio', () => {
       const pricing = { items: [{ model: 'm', billing: 'per-call', perCall: 0.01, groupRatio: 2, inputRatio: 0, completionRatio: 0 }] }
@@ -219,6 +241,93 @@ describe('dsh-provider-balance — 核心逻辑冒烟测试', () => {
       const s = ensureStateSync(f)
       assert.deepStrictEqual(s.custom, { x: { balance: 100 } })
     })
+
+    it('writeStateSync 自动创建缺失的父目录（首次运行 $DSH_HOME 不存在）', () => {
+      const f = path.join(tmpDir, 'a', 'b', 'state.json')
+      writeStateSync(f, { ok: true })
+      assert.deepStrictEqual(readStateSync(f), { ok: true })
+    })
+  })
+
+  describe('createUsageTracker 成本累计', () => {
+    const mkCtx = () => {
+      const handlers = {}
+      return { ctx: { on: (type, fn) => { handlers[type] = fn } }, handlers }
+    }
+    const mkEvent = (provider, model, usage) => ({
+      type: 'assistant/message',
+      data: { header: { config: { provider, model } }, turn: 0, step: 0, usage }
+    })
+    // DSHA 1.2+ 事件：无 header.config，provider/model 仅存在于 message.source
+    const mkEventV2 = (provider, model, usage) => ({
+      type: 'assistant/message',
+      data: { message: { role: 'assistant', source: { kind: 'model', provider, model } }, turn: 0, step: 0, usage }
+    })
+
+    it('per-token 成本能从 delta 正确累计（字段名对齐 schema）', () => {
+      const { ctx, handlers } = mkCtx()
+      const f = path.join(tmpDir, 'tracker-pt.json')
+      writeStateSync(f, ensureStateSync(f))
+      const providers = [
+        { id: 'p-token', pricing: { items: [{ model: 'm', billing: 'per-token', perCall: 0, inputRatio: 1, completionRatio: 1, groupRatio: 1 }] } }
+      ]
+      const tracker = createUsageTracker(ctx, f, () => {}, providers)
+      handlers['session/event']({ id: 's1' }, mkEvent('p-token', 'm', { inputTokens: 500_000, outputTokens: 500_000 }))
+      const s = ensureStateSync(f)
+      // 每 500k token = $1，input $1 + output $1 = $2
+      assert.strictEqual(s.usage['p-token'].todayCost, 2, 'per-token cost should be accumulated')
+      assert.strictEqual(s.books['p-token'].spent, 2, 'books.spent should accumulate too')
+      tracker.stop()
+    })
+
+    it('per-call 微额成本不被 roundMoney 抹零（保留 6 位小数）', () => {
+      const { ctx, handlers } = mkCtx()
+      const f = path.join(tmpDir, 'tracker-pc.json')
+      writeStateSync(f, ensureStateSync(f))
+      const providers = [
+        { id: 'p-call', pricing: { items: [{ model: 'm', billing: 'per-call', perCall: 0.001, inputRatio: 0, completionRatio: 0, groupRatio: 1 }] } }
+      ]
+      const tracker = createUsageTracker(ctx, f, () => {}, providers)
+      handlers['session/event']({ id: 's1' }, mkEvent('p-call', 'm', { inputTokens: 10, outputTokens: 5 }))
+      const s = ensureStateSync(f)
+      assert.strictEqual(s.usage['p-call'].todayCost, 0.001, 'per-call micro cost must be preserved')
+      assert.strictEqual(s.books['p-call'].spent, 0.001, 'books.spent must preserve micro cost')
+      tracker.stop()
+    })
+
+    it('超期日归档（>30 天）在日期切换时被自动删除', () => {
+      const { ctx, handlers } = mkCtx()
+      const f = path.join(tmpDir, 'tracker-prune.json')
+      const old = { version: 1, custom: {}, books: {}, usage: {} }
+      const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10)
+      const ancient = new Date(Date.now() - 60 * 86400000).toISOString().slice(0, 10)
+      old.usage['p-prune'] = {
+        todayKey: yesterday, todayCalls: 1, todayTokens: 1, todayCost: 0.001, models: {},
+        [`${ancient}_done`]: { calls: 99, tokens: 99, cost: 9, models: {} }
+      }
+      writeStateSync(f, old)
+      const tracker = createUsageTracker(ctx, f, () => {}, [])
+      handlers['session/event']({ id: 's1' }, mkEvent('p-prune', 'm', { inputTokens: 1, outputTokens: 1 }))
+      const s = ensureStateSync(f)
+      assert.ok(s.usage['p-prune'][`${yesterday}_done`], 'yesterday should be archived')
+      assert.ok(!s.usage['p-prune'][`${ancient}_done`], 'ancient archive should be pruned')
+      tracker.stop()
+    })
+
+    it('支持 DSHA 1.2+ 事件：provider/model 仅从 message.source 提取', () => {
+      const { ctx, handlers } = mkCtx()
+      const f = path.join(tmpDir, 'tracker-v2.json')
+      writeStateSync(f, ensureStateSync(f))
+      const providers = [
+        { id: 'p-v2', pricing: { items: [{ model: 'm', billing: 'per-call', perCall: 0.001, inputRatio: 0, completionRatio: 0, groupRatio: 1 }] } }
+      ]
+      const tracker = createUsageTracker(ctx, f, () => {}, providers)
+      handlers['session/event']({ id: 's1' }, mkEventV2('p-v2', 'm', { inputTokens: 10, outputTokens: 5 }))
+      const s = ensureStateSync(f)
+      assert.strictEqual(s.usage['p-v2'].todayCalls, 1, 'should record call via message.source.provider')
+      assert.strictEqual(s.books['p-v2'].spent, 0.001)
+      tracker.stop()
+    })
   })
 
   describe('books 归档逻辑', () => {
@@ -254,6 +363,23 @@ describe('dsh-provider-balance — 核心逻辑冒烟测试', () => {
       assert.ok(Array.isArray(result))
       // 即使空 ctx，deepseek 应被包含（因 deepProps 默认）
       assert.ok(result.some(p => p.id === 'deepseek'), 'should include deepseek by default')
+    })
+  })
+
+  describe('凭据解析调用契约', () => {
+    it('resolveApiKey 返回 {value, source} 对象', async () => {
+      const ctx = {
+        credentials: {
+          resolve: async (env) => env === 'TEST_KEY' ? { value: 'sk-abc123', source: 'env' } : null
+        },
+        llm: { listProviders: () => [{ id: 'test-p', name: 'Test' }] },
+        settings: { describe: async () => [{ ns: 'llm-pi-ai', value: { providers: { 'test-p': { baseURL: 'https://relay.example.com', apiKeyEnv: 'TEST_KEY' } } } }] }
+      }
+      // resolveApiKey 是模块内函数，通过 collectProviders 侧效应验证 credential 字段
+      const result = await collectProviders(ctx)
+      const p = result.find(x => x.id === 'test-p')
+      assert.ok(p, 'provider should be found')
+      assert.strictEqual(p.credential, 'ok', 'credential should resolve')
     })
   })
 })
@@ -305,6 +431,52 @@ describe('cachedAsync 缓存与失效', () => {
     await assert.rejects(cachedAsync(fn, 'k3', 60000))
     const v = await cachedAsync(fn, 'k3', 60000)
     assert.equal(v, 'ok', 'should retry on next call')
+  })
+})
+
+describe('fetchJson 重试', () => {
+  it('HTTP 500 后重试成功（每轮独立 AbortController 与定时器）', async () => {
+    // 服务端第一次返回 500 触发 throw，第二次正常返回。
+    let requests = 0
+    const server = http.createServer((_req, res) => {
+      requests += 1
+      const status = requests === 1 ? 500 : 200
+      res.writeHead(status, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ ok: status === 200, requests }))
+    })
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+    try {
+      const url = `http://127.0.0.1:${server.address().port}/x`
+      const data = await fetchJson(url, { timeout: 1000, retries: 1, retryDelay: 10 })
+      assert.ok(data.ok === true, '重试应成功返回数据')
+      assert.equal(requests, 2, '服务端应收到两次请求')
+    } finally {
+      await new Promise(resolve => server.close(resolve))
+    }
+  })
+
+  it('逐轮独立的 AbortController 能完成超时-重试全流程', async () => {
+    // 服务端首请求慢响应（30ms）触发 5ms 客户端超时；第二次快速响应。
+    // 保持较长 retryDelay=50 以覆盖第一个分定时器的剩余期。
+    // 首请求延迟 60ms 超过 20ms 超时；次请求延迟 0 能在超时内完成
+    let requests = 0
+    const server = http.createServer((_req, res) => {
+      requests += 1
+      const delay = requests === 1 ? 60 : 0
+      setTimeout(() => {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, requests }))
+      }, delay)
+    })
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+    try {
+      const url = `http://127.0.0.1:${server.address().port}/x`
+      const data = await fetchJson(url, { timeout: 20, retries: 1, retryDelay: 10 })
+      assert.ok(data.ok === true, '超时重试应成功')
+      assert.equal(data.requests, 2, '服务端应收到两次请求')
+    } finally {
+      await new Promise(resolve => server.close(resolve))
+    }
   })
 })
 
