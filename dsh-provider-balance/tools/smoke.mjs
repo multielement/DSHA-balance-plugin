@@ -155,6 +155,26 @@ describe('dsh-provider-balance — 核心逻辑冒烟测试', () => {
       assert.strictEqual(r.groupRatio, 2)
     })
 
+    it('过滤空模型名和无效价格倍率', () => {
+      const r = normalizeOneApiPricing({
+        data: [
+          null,
+          { model_name: '', model_ratio: 1 },
+          { model_name: 'negative', model_ratio: -1 },
+          { model_name: 'infinite', completion_ratio: Infinity },
+          { model_name: ' valid ', model_ratio: 0, completion_ratio: 0 }
+        ],
+        group_ratio: -2
+      })
+      assert.strictEqual(r.groupRatio, 1)
+      assert.deepStrictEqual(r.items.map(item => item.model), ['valid'])
+      assert.strictEqual(r.items[0].inputRatio, 0)
+    })
+
+    it('全部价格条目无效时返回 null', () => {
+      assert.strictEqual(normalizeOneApiPricing({ data: [{ model_name: '', model_price: -1 }] }), null)
+    })
+
     it('null 输入返回 null', () => {
       assert.strictEqual(normalizeOneApiPricing(null), null)
       assert.strictEqual(normalizeOneApiPricing(undefined), null)

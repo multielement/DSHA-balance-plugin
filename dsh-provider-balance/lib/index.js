@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url'
 // ================================================================
 export const PLUGIN_ID = 'dsh-provider-balance'
 export const PLUGIN_NAME = '供应商余额管家'
-export const PLUGIN_VERSION = '1.1.9'
+export const PLUGIN_VERSION = '1.2.0'
 
 // DSH 插件加载契约：必须导出小写 name / inject（loader 读取 entry.options.name）
 // 仅声明必需服务，缺失的会被置 null（collectProviders 已做容错）
@@ -251,17 +251,19 @@ export function normalizeOneApiPricing(raw) {
   const list = Array.isArray(d) ? d : (Array.isArray(d?.data) ? d.data : [])
   if (!list.length) return null
   const groupRaw = raw.group_ratio
-  const groupRatio = typeof groupRaw === 'number' ? groupRaw : (typeof groupRaw?.default === 'number' ? groupRaw.default : 1)
-  const items = list.map(m => {
-    const modelName = String(m.model_name ?? m.model ?? m.id ?? '')
-    const quotaType = Number(m.quota_type ?? (m.model_price > 0 ? 1 : 0))
-    const perCall = Number(m.model_price ?? 0)
-    const inputRatio = Number(m.model_ratio ?? 1)
-    const completionRatio = Number(m.completion_ratio ?? 1)
+  const groupValue = Number(groupRaw?.default ?? groupRaw)
+  const groupRatio = Number.isFinite(groupValue) && groupValue >= 0 ? groupValue : 1
+  const items = list.flatMap(m => {
+    const modelName = String(m?.model_name ?? m?.model ?? m?.id ?? '').trim()
+    const quotaType = Number(m?.quota_type ?? (m?.model_price > 0 ? 1 : 0))
+    const perCall = Number(m?.model_price ?? 0)
+    const inputRatio = Number(m?.model_ratio ?? 1)
+    const completionRatio = Number(m?.completion_ratio ?? 1)
+    if (!modelName || ![perCall, inputRatio, completionRatio].every(v => Number.isFinite(v) && v >= 0)) return []
     const billing = quotaType === 1 ? 'per-call' : 'per-token'
-    return { model: modelName, billing, perCall, inputRatio, completionRatio, groupRatio }
+    return [{ model: modelName, billing, perCall, inputRatio, completionRatio, groupRatio }]
   })
-  return { groupRatio, items, currency: 'USD' }
+  return items.length ? { groupRatio, items, currency: 'USD' } : null
 }
 
 /**
