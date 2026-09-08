@@ -6,8 +6,10 @@
 const API_BASE = '/dsh-provider-balance'
 let lastData = null
 let pollTimer = null
+let pollingEnabled = false
 let pollAbort = null
 let refreshAbort = null
+let providerRefreshAbort = null
 let requestSequence = 0
 
 // 面板关闭时清理定时器
@@ -24,6 +26,14 @@ function fmt(n, decimals = 2) {
 
 function esc(s) {
   return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+}
+
+async function fetchJson(url, options) {
+  const res = await fetch(url, options)
+  let data
+  try { data = await res.json() } catch { data = null }
+  if (!res.ok) throw new Error(data?.error || `HTTP ${res.status}`)
+  return data
 }
 
 // ================================================================
@@ -170,8 +180,7 @@ async function poll() {
   pollAbort = controller
   const sequence = ++requestSequence
   try {
-    const res = await fetch(`${API_BASE}/summary.json`, { signal: controller.signal })
-    const data = await res.json()
+    const data = await fetchJson(`${API_BASE}/summary.json`, { signal: controller.signal })
     if (!renderLatest(data, sequence)) return
     const dot = document.querySelector('#dsh-pb-pill-dot')
     if (dot) dot.className = 'dot' + (data.ok ? '' : ' err')
@@ -196,21 +205,28 @@ async function poll() {
     if (dot) dot.className = 'dot err'
   } finally {
     if (pollAbort === controller) pollAbort = null
-    if (pollTimer === true) pollTimer = setTimeout(poll, 60_000)
+    if (pollingEnabled) pollTimer = setTimeout(poll, 60_000)
   }
 }
 
 async function refreshProvider(providerId) {
+  providerRefreshAbort?.abort()
+  const controller = new AbortController()
+  providerRefreshAbort = controller
   const sequence = ++requestSequence
   try {
-    const res = await fetch(`${API_BASE}/refresh.json`, {
+    const data = await fetchJson(`${API_BASE}/refresh.json`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ provider: providerId })
+      body: JSON.stringify({ provider: providerId }),
+      signal: controller.signal
     })
-    const data = await res.json()
     renderLatest(data, sequence)
-  } catch (e) { console.error('[dsh-pb] refresh provider error:', e) }
+  } catch (e) {
+    if (e.name !== 'AbortError') console.error('[dsh-pb] refresh provider error:', e)
+  } finally {
+    if (providerRefreshAbort === controller) providerRefreshAbort = null
+  }
 }
 
 async function doRefresh() {
@@ -219,13 +235,12 @@ async function doRefresh() {
   refreshAbort = controller
   const sequence = ++requestSequence
   try {
-    const res = await fetch(`${API_BASE}/refresh.json`, {
+    const data = await fetchJson(`${API_BASE}/refresh.json`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: '{}',
       signal: controller.signal
     })
-    const data = await res.json()
     renderLatest(data, sequence)
   } catch (e) {
     if (e.name !== 'AbortError') console.error('[dsh-pb] refresh error:', e)
@@ -277,12 +292,11 @@ function showSetBalance(providerId, mode, data) {
       const cur = dlg.querySelector('#dlg-cur').value
       if (isNaN(bal) || bal < 0) { alert('请输入非负数字'); return }
       try {
-        const res = await fetch(`${API_BASE}/custom.json`, {
+        const json = await fetchJson(`${API_BASE}/custom.json`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ provider: providerId, balance: bal, currency: cur, resetBooks: mode === 'custom' })
         })
-        const json = await res.json()
         if (!json.ok) { alert('保存失败: ' + (json.error || '')); return }
         cleanup()
         await poll()
@@ -302,8 +316,8 @@ function showSetBalance(providerId, mode, data) {
 // ================================================================
 let started = false
 function startPolling() {
-  if (pollTimer) return
-  pollTimer = true
+  if (pollingEnabled) return
+  pollingEnabled = true
   poll()
 }
 
@@ -315,12 +329,15 @@ function start() {
 }
 
 function stopPolling() {
-  if (pollTimer !== true) clearTimeout(pollTimer)
+  pollingEnabled = false
+  clearTimeout(pollTimer)
   pollTimer = null
   pollAbort?.abort()
   pollAbort = null
   refreshAbort?.abort()
   refreshAbort = null
+  providerRefreshAbort?.abort()
+  providerRefreshAbort = null
 }
 
 if (document.readyState === 'loading') {

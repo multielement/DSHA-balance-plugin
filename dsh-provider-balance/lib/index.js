@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url'
 // ================================================================
 export const PLUGIN_ID = 'dsh-provider-balance'
 export const PLUGIN_NAME = '供应商余额管家'
-export const PLUGIN_VERSION = '1.1.3'
+export const PLUGIN_VERSION = '1.1.4'
 
 // DSH 插件加载契约：必须导出小写 name / inject（loader 读取 entry.options.name）
 // 仅声明必需服务，缺失的会被置 null（collectProviders 已做容错）
@@ -338,7 +338,41 @@ export async function collectProviders(ctx) {
 export function createUsageTracker(ctx, stateFilePath, onUpdated, providersRef = null) {
   const prev = new Map()  // bucketKey → {provider, model, usage}
   const evicted = new Set()
+  const pendingCosts = []
   function bucketKey(sid, turn, step, provider, model) { return `${sid}|${turn}|${step}|${provider}|${model}` }
+
+  function estimateCost(providerId, model, delta, countCall) {
+    const currentProviders = typeof providersRef === 'function' ? providersRef() : (providersRef || [])
+    const provider = currentProviders.find(p => p.id === providerId)
+    if (!provider?.pricing) return null
+    const modelPricing = provider.pricing.overrides?.[model] || provider.pricing.items?.find(i => i.model === model)
+    if (modelPricing?.billing === 'per-call' && !countCall) return 0
+    return estimateCostFromUsage(provider.pricing, {
+      inputTokens: delta.input,
+      outputTokens: delta.output,
+      cacheReadTokens: delta.cacheRead,
+      cacheWriteTokens: delta.cacheWrite,
+      reasoningTokens: delta.reasoning
+    }, model, 'session/event')?.cost ?? 0
+  }
+
+  function addCost(state, providerId, model, cost, dateKey = todayKey()) {
+    if (!(cost > 0)) return
+    const bucket = state.usage[providerId]
+    const target = bucket?.todayKey === dateKey ? bucket : bucket?.[`${dateKey}_done`]
+    if (!target) return
+    if (target === bucket) target.todayCost = roundMoney((target.todayCost || 0) + cost, 6)
+    else target.cost = roundMoney((target.cost || 0) + cost, 6)
+    const modelBucket = target.models?.[model]
+    if (modelBucket) modelBucket.cost = roundMoney((modelBucket.cost || 0) + cost, 6)
+    const customCurrency = state.custom[providerId]?.currency
+    const booksCurrency = state.books[providerId]?.currency || customCurrency || 'USD'
+    if (booksCurrency === 'USD') {
+      if (!state.books[providerId]) state.books[providerId] = { spent: 0, currency: 'USD', updatedAt: nowIso() }
+      state.books[providerId].spent = roundMoney((state.books[providerId].spent || 0) + cost, 6)
+      state.books[providerId].updatedAt = nowIso()
+    }
+  }
 
   function applyDelta(providerId, model, delta, countCall) {
     const tk = todayKey()
@@ -368,36 +402,9 @@ export function createUsageTracker(ctx, stateFilePath, onUpdated, providersRef =
     // 估算成本并更新 usage.todayCost 和 books.spent
     let estimatedCost = 0
     try {
-      const currentProviders = typeof providersRef === 'function' ? providersRef() : (providersRef || [])
-      const provider = currentProviders.find(p => p.id === providerId)
-      if (provider?.pricing) {
-        const modelPricing = provider.pricing.overrides?.[model] || provider.pricing.items?.find(i => i.model === model)
-        // 按次价格只在首个增量计费；token 增量仍持续累计。
-        const cost = modelPricing?.billing === 'per-call' && !countCall
-          ? 0
-          : estimateCostFromUsage(provider.pricing, {
-              inputTokens: delta.input,
-              outputTokens: delta.output,
-              cacheReadTokens: delta.cacheRead,
-              cacheWriteTokens: delta.cacheWrite,
-              reasoningTokens: delta.reasoning
-            }, model, 'session/event')?.cost
-        if (cost != null && cost > 0) {
-          estimatedCost = cost
-          // 保留 6 位小数，避免 per-call 微额计价被 roundMoney(2) 抹零
-          bucket.todayCost = roundMoney(bucket.todayCost + cost, 6)
-          const customCurrency = state.custom[providerId]?.currency
-          const booksCurrency = state.books[providerId]?.currency || customCurrency || 'USD'
-          // 内置/中转定价均为 USD；跨币种缺少汇率时不修改自定义余额账本。
-          if (booksCurrency === 'USD') {
-            if (!state.books[providerId]) {
-              state.books[providerId] = { spent: 0, currency: 'USD', updatedAt: nowIso() }
-            }
-            state.books[providerId].spent = roundMoney((state.books[providerId].spent || 0) + cost, 6)
-            state.books[providerId].updatedAt = nowIso()
-          }
-        }
-      }
+      const cost = estimateCost(providerId, model, delta, countCall)
+      if (cost == null) pendingCosts.push({ providerId, model, delta, countCall, dateKey: tk })
+      else estimatedCost = cost
     } catch (e) {
       console.error(`[${PLUGIN_ID}] usage cost estimation error:`, e.message)
     }
@@ -405,7 +412,7 @@ export function createUsageTracker(ctx, stateFilePath, onUpdated, providersRef =
     if (!bucket.models[model]) bucket.models[model] = { calls: 0, tokens: 0, cost: 0 }
     if (countCall) bucket.models[model].calls += 1
     bucket.models[model].tokens += totalTokens
-    bucket.models[model].cost = roundMoney((bucket.models[model].cost || 0) + estimatedCost, 6)
+    addCost(state, providerId, model, estimatedCost, tk)
     state.seenProviders = [...new Set([...(state.seenProviders || []), providerId])]
     writeStateSync(stateFilePath, state)
     onUpdated()
@@ -458,7 +465,7 @@ export function createUsageTracker(ctx, stateFilePath, onUpdated, providersRef =
         evicted.add(oldestKey)
         if (evicted.size > 10_000) evicted.delete(evicted.keys().next().value)
       }
-      if (Object.values(delta).every(v => v <= 0)) return
+      if (Object.values(delta).every(v => v <= 0) && prevEntry) return
       applyDelta(provider, model, delta, !prevEntry)
     } catch (e) {
       console.error('[provider-balance] usage tracking error:', e)
@@ -467,10 +474,29 @@ export function createUsageTracker(ctx, stateFilePath, onUpdated, providersRef =
 
   return {
     seen: prev,
+    flushPendingCosts: () => {
+      if (!pendingCosts.length) return 0
+      const state = ensureStateSync(stateFilePath)
+      let flushed = 0
+      for (let i = pendingCosts.length - 1; i >= 0; i--) {
+        const pending = pendingCosts[i]
+        const cost = estimateCost(pending.providerId, pending.model, pending.delta, pending.countCall)
+        if (cost == null) continue
+        addCost(state, pending.providerId, pending.model, cost, pending.dateKey)
+        pendingCosts.splice(i, 1)
+        flushed += 1
+      }
+      if (flushed) {
+        writeStateSync(stateFilePath, state)
+        onUpdated()
+      }
+      return flushed
+    },
     stop: () => {
       if (typeof dispose === 'function') dispose()
       prev.clear()
       evicted.clear()
+      pendingCosts.length = 0
     }
   }
 }
@@ -486,6 +512,7 @@ export function apply(ctx) {
   let stopUsageTracker = () => {}
   let disposed = false
   let summaryGeneration = 0
+  let flushPendingCosts = () => 0
   const disposers = []
   const subscribers = new Set()
 
@@ -547,8 +574,8 @@ export function apply(ctx) {
     }, cacheKey, PRICING_TTL_MS)
   }
 
-  async function buildSummary(bustAll = false, commit = false) {
-    const generation = ++summaryGeneration
+  async function buildSummary(bustAll = false, commit = false, notify = false) {
+    const generation = commit ? ++summaryGeneration : summaryGeneration
     const providerSnapshot = [...providers]
     // 并行探测所有供应商，单家失败降级为 available:false 而不阻塞整体
     const probed = await Promise.all(providerSnapshot.map(async p => {
@@ -558,6 +585,11 @@ export function apply(ctx) {
       ])
       return { provider: p, balance: bal, pricing: price }
     }))
+    const canCommit = commit && generation === summaryGeneration && !disposed
+    if (canCommit) {
+      for (const { provider, pricing } of probed) provider.pricing = pricing
+      flushPendingCosts()
+    }
     // 探测可能持续数秒，完成后读取最新状态，避免覆盖期间到达的用量事件。
     const state = ensureStateSync(stateFilePath)
     const results = probed.map(({ provider: p, balance: bal, pricing: price }) => {
@@ -569,15 +601,19 @@ export function apply(ctx) {
       }
     })
     const summary = { ok: true, now: nowIso(), providers: results }
-    if (generation === summaryGeneration && !disposed) {
-      for (const { provider, pricing } of probed) provider.pricing = pricing
-      if (commit) lastSummary = summary
+    if (canCommit) {
+      lastSummary = summary
+      if (notify) {
+        for (const cb of subscribers) { try { cb(summary) } catch {} }
+      }
     }
     return summary
   }
 
   async function init() {
-    stopUsageTracker = createUsageTracker(ctx, stateFilePath, () => { lastSummary = null }, () => providers).stop
+    const tracker = createUsageTracker(ctx, stateFilePath, () => { lastSummary = null }, () => providers)
+    stopUsageTracker = tracker.stop
+    flushPendingCosts = tracker.flushPendingCosts
     try { providers = await collectProviders(ctx) } catch (e) { console.error('[provider-balance] collectProviders failed:', e) }
     if (disposed) return
     await buildSummary(false, true)
@@ -626,14 +662,18 @@ export function apply(ctx) {
   }
 
   async function sendJson(res, obj, status = 200) {
+    if (res.writableEnded || res.destroyed) return false
     const body = JSON.stringify(obj, null, 2)
     res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' })
     res.end(body)
+    return true
   }
 
   function sendText(res, text, status = 200, mime = 'text/plain; charset=utf-8') {
+    if (res.writableEnded || res.destroyed) return false
     res.writeHead(status, { 'Content-Type': mime })
     res.end(text)
+    return true
   }
 
   async function handleSummary(req, res) { await sendJson(res, await buildSummary()) }
@@ -650,10 +690,7 @@ export function apply(ctx) {
         invalidateCached(`${cacheNamespace}bal_`)
         invalidateCached(`${cacheNamespace}price_`)
       }
-      const summary = await buildSummary(false, true)
-      if (summary === lastSummary) {
-        for (const cb of subscribers) { try { cb(summary) } catch {} }
-      }
+      const summary = await buildSummary(false, true, true)
       await sendJson(res, summary)
     } catch (e) {
       console.error(`[${PLUGIN_ID}] refresh failed:`, e.message)
@@ -764,7 +801,7 @@ export function apply(ctx) {
   // 暴露内部接口（供测试、其他插件）
   return {
     getSummary: () => lastSummary,
-    refreshAll: () => buildSummary(true),
+    refreshAll: () => buildSummary(true, true, true),
     subscribeSummary: (cb) => { subscribers.add(cb); return () => subscribers.delete(cb) }
   }
 }

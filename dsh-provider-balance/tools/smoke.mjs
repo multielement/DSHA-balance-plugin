@@ -407,6 +407,41 @@ describe('dsh-provider-balance — 核心逻辑冒烟测试', () => {
       tracker.stop()
     })
 
+    it('零 token 的 per-call 首事件仍记录调用和费用', () => {
+      const { ctx, handlers } = mkCtx()
+      const f = path.join(tmpDir, 'tracker-zero-call.json')
+      const providers = [
+        { id: 'p-zero', pricing: { items: [{ model: 'm', billing: 'per-call', perCall: 0.25, groupRatio: 1 }] } }
+      ]
+      const tracker = createUsageTracker(ctx, f, () => {}, providers)
+      handlers['session/event']({ id: 's-zero' }, mkEvent('p-zero', 'm', {}))
+      const usage = ensureStateSync(f).usage['p-zero']
+      assert.strictEqual(usage.todayCalls, 1)
+      assert.strictEqual(usage.todayTokens, 0)
+      assert.strictEqual(usage.todayCost, 0.25)
+      tracker.stop()
+    })
+
+    it('pricing 就绪后补算初始化窗口成本', () => {
+      const { ctx, handlers } = mkCtx()
+      const f = path.join(tmpDir, 'tracker-pending-cost.json')
+      const providers = [{ id: 'p-pending' }]
+      const tracker = createUsageTracker(ctx, f, () => {}, () => providers)
+      handlers['session/event']({ id: 's-pending' }, mkEvent('p-pending', 'm', { inputTokens: 500_000, outputTokens: 0 }))
+      let usage = ensureStateSync(f).usage['p-pending']
+      assert.strictEqual(usage.todayCalls, 1)
+      assert.strictEqual(usage.todayTokens, 500_000)
+      assert.strictEqual(usage.todayCost, 0)
+      providers[0].pricing = { items: [{ model: 'm', billing: 'per-token', inputRatio: 1, completionRatio: 1, groupRatio: 1 }] }
+      assert.strictEqual(tracker.flushPendingCosts(), 1)
+      usage = ensureStateSync(f).usage['p-pending']
+      assert.strictEqual(usage.todayCalls, 1)
+      assert.strictEqual(usage.todayTokens, 500_000)
+      assert.strictEqual(usage.todayCost, 1)
+      assert.strictEqual(usage.models.m.cost, 1)
+      tracker.stop()
+    })
+
     it('计数器回退会更新基线，模型切换会创建新调用', () => {
       const { ctx, handlers } = mkCtx()
       const f = path.join(tmpDir, 'tracker-reset.json')
