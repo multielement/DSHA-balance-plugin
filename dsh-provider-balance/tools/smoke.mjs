@@ -769,6 +769,12 @@ describe('panel.js / panel.css 文件存在性', () => {
     assert.ok(panelCss.includes('.panel'), 'should contain .panel')
     assert.ok(panelCss.includes('.pcard'), 'should contain .pcard')
   })
+
+  it('请求体按 UTF-8 字节统一解码', () => {
+    const indexJs = fs.readFileSync(path.join(libDir, 'index.js'), 'utf8')
+    assert.ok(indexJs.includes("Buffer.concat(chunks).toString('utf8')"))
+    assert.ok(indexJs.includes('Buffer.from(String(chunk))'))
+  })
 })
 
 describe('cachedAsync 缓存与失效', () => {

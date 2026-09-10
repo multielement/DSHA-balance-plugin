@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url'
 // ================================================================
 export const PLUGIN_ID = 'dsh-provider-balance'
 export const PLUGIN_NAME = '供应商余额管家'
-export const PLUGIN_VERSION = '1.2.2'
+export const PLUGIN_VERSION = '1.2.3'
 
 // DSH 插件加载契约：必须导出小写 name / inject（loader 读取 entry.options.name）
 // 仅声明必需服务，缺失的会被置 null（collectProviders 已做容错）
@@ -678,7 +678,7 @@ export function apply(ctx) {
   // 请求体解析工具
   function parseBody(req) {
     return new Promise((resolve, reject) => {
-      let body = ''
+      const chunks = []
       let size = 0
       let settled = false
       const fail = (error) => {
@@ -688,18 +688,19 @@ export function apply(ctx) {
       }
       req.on('data', chunk => {
         if (settled) return
-        size += chunk.length
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk))
+        size += buffer.length
         if (size > MAX_BODY_BYTES) {
           fail(Object.assign(new Error('请求体过大'), { status: 413 }))
           req.resume?.()
           return
         }
-        body += chunk
+        chunks.push(buffer)
       })
       req.on('end', () => {
         if (settled) return
         settled = true
-        try { resolve(JSON.parse(body || '{}')) }
+        try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')) }
         catch (e) { reject(Object.assign(new Error('JSON 解析失败: ' + e.message), { status: 400 })) }
       })
       req.on('aborted', () => fail(Object.assign(new Error('请求已中止'), { status: 400 })))

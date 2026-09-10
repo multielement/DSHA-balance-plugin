@@ -1,6 +1,6 @@
 {
   "name": "dsh-provider-balance",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "description": "DSH/DSHA 供应商余额管家 —— 自动查询余额、识别按次/按量倍率、支持自定义余额本地记账",
   "keywords": [
     "dsh",
